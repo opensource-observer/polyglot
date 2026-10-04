@@ -6,6 +6,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+### Added
+
+- Rust `build_scope_with(expr, &mut visitor)` builds the same scope tree as
+  `build_scope` while reporting its construction to an observe-only
+  `ScopeVisitor`: scope entry and exit, each FROM/JOIN item in source order,
+  and the FROM-item subtrees that get no scope. Every scope a build creates
+  has a `ScopeId`, exposed as `Scope::id()`.
+
 ### Fixed
 
 - `Scope::traverse` and `traverse_scope` now yield derived-table scopes in

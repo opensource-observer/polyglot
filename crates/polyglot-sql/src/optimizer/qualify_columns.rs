@@ -13,7 +13,8 @@ use crate::expressions::{
 use crate::resolver::{Resolver, ResolverError};
 use crate::schema::{normalize_name, Schema};
 use crate::scope::{
-    build_scope_with_ctes, selected_reference_scope, traverse_scope, Scope, SourceInfo, SourceKind,
+    build_scope_with_ctes, selected_reference_scope, traverse_scope, NoopScopeVisitor, Scope,
+    SourceInfo, SourceKind,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -282,6 +283,7 @@ fn qualify_query_inner(
                     visible_outer.push(selected_reference_scope(&build_scope_with_ctes(
                         &Expression::Select(select.clone()),
                         &ctes,
+                        &mut NoopScopeVisitor,
                     )));
                 }
                 let qualified =
@@ -303,6 +305,7 @@ fn qualify_query_inner(
                 visible_outer.push(selected_reference_scope(&build_scope_with_ctes(
                     &Expression::Select(select.clone()),
                     &ctes,
+                    &mut NoopScopeVisitor,
                 )));
             }
             join.this = qualify_nested_queries(join.this, schema, options, &ctes, &visible_outer)?;
@@ -311,7 +314,11 @@ fn qualify_query_inner(
     }
 
     if matches!(expression, Expression::Select(_)) {
-        let scope = selected_reference_scope(&build_scope_with_ctes(&expression, &ctes));
+        let scope = selected_reference_scope(&build_scope_with_ctes(
+            &expression,
+            &ctes,
+            &mut NoopScopeVisitor,
+        ));
         let mut nested_outer = outer.to_vec();
         nested_outer.push(scope.clone());
         // Temporarily detach relation queries: they were already visited, and
