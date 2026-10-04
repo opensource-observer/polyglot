@@ -187,7 +187,8 @@ pub struct Scope {
     /// Child UDTF (User Defined Table Function) scopes
     pub udtf_scopes: Vec<Scope>,
 
-    /// Combined derived_table_scopes + udtf_scopes in definition order
+    /// Never populated, kept for compatibility; derived tables are in
+    /// `derived_table_scopes` and UDTFs in `udtf_scopes`
     pub table_scopes: Vec<Scope>,
 
     /// Union/set operation scopes (left and right)
@@ -468,7 +469,10 @@ impl Scope {
         for scope in &self.union_scopes {
             scope.traverse_impl(result);
         }
-        for scope in &self.table_scopes {
+        for scope in &self.derived_table_scopes {
+            scope.traverse_impl(result);
+        }
+        for scope in &self.udtf_scopes {
             scope.traverse_impl(result);
         }
         for scope in &self.subquery_scopes {
@@ -1719,8 +1723,47 @@ mod tests {
         );
 
         let traversed = scope.traverse();
-        // Should include: CTE scope, subquery scope, root scope
-        assert!(traversed.len() >= 3);
+        // CTE scope, subquery scope, root scope
+        assert_eq!(traversed.len(), 3);
+    }
+
+    #[test]
+    fn test_traverse_scope_nested_derived_tables_post_order() {
+        let ast = Parser::parse_sql("SELECT a FROM (SELECT b FROM (SELECT c FROM t) y) x").unwrap();
+        let scopes = traverse_scope(&ast[0]);
+
+        let types: Vec<_> = scopes.iter().map(|s| s.scope_type).collect();
+        assert_eq!(
+            types,
+            vec![
+                ScopeType::DerivedTable,
+                ScopeType::DerivedTable,
+                ScopeType::Root
+            ]
+        );
+        assert!(scopes[0].sources.contains_key("t"));
+        assert!(scopes[1].sources.contains_key("y"));
+        assert!(scopes[2].sources.contains_key("x"));
+    }
+
+    #[test]
+    fn test_traverse_scope_mixed_scopes_each_once() {
+        let ast = Parser::parse_sql(
+            "WITH c AS (SELECT a FROM t1) \
+             SELECT * FROM (SELECT a FROM c) d \
+             WHERE EXISTS (SELECT 1 FROM t2) \
+             UNION ALL SELECT a FROM t3",
+        )
+        .unwrap();
+        let scopes = traverse_scope(&ast[0]);
+
+        let count = |scope_type| scopes.iter().filter(|s| s.scope_type == scope_type).count();
+        assert_eq!(count(ScopeType::Cte), 1);
+        assert_eq!(count(ScopeType::DerivedTable), 1);
+        assert_eq!(count(ScopeType::Subquery), 1);
+        assert_eq!(count(ScopeType::SetOperation), 2);
+        assert_eq!(count(ScopeType::Root), 1);
+        assert_eq!(scopes.len(), 6);
     }
 
     #[test]
