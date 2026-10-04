@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- `Scope::traverse` and `traverse_scope` now yield derived-table scopes in
+  post-order. Previously they walked the never-populated `table_scopes`, so
+  `traverse_scope("SELECT a FROM (SELECT b FROM t) x")` returned only the root
+  scope. `Scope::table_scopes` is documented as never populated.
+  - `qualify_tables` no longer reuses a generated alias (e.g. `_0`) that is
+    already used inside a derived table.
+  - `eliminate_joins` now also applies inside derived tables.
+
 ## [0.13.1] - 2026-09-30
 
 ### Fixed
