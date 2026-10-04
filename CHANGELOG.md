@@ -15,6 +15,15 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   - `qualify_tables` no longer reuses a generated alias (e.g. `_0`) that is
     already used inside a derived table.
   - `eliminate_joins` now also applies inside derived tables.
+- `x IN ((SELECT ...) UNION (SELECT ...))` and the `NOT IN`, `INTERSECT` and
+  `EXCEPT` forms now parse as an `In` with `query` set to the set operation
+  instead of a one-element expression list, so scope analysis sees the
+  subquery. BigQuery `FOR v IN (WITH ...) DO` and the public `Parser::parse_in`
+  now also accept `WITH` queries. Plain (non-pretty) round-trip output is
+  unchanged. Two output changes follow from the new shape: pretty output
+  breaks the set operation across lines like any `IN (SELECT ...)`, and
+  Snowflake renders `NOT IN` over a set operation as `<> ALL (...)`, as it
+  already does for `NOT IN (SELECT ...)`.
 
 ## [0.13.1] - 2026-09-30
 

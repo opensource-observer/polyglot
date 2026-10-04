@@ -31288,44 +31288,16 @@ impl Parser {
                             is_field: false,
                         }))
                     } else if self.match_token(TokenType::LParen) {
-                        if self.check(TokenType::Select) || self.check(TokenType::With) {
-                            let subquery = self.parse_statement()?;
-                            self.expect(TokenType::RParen)?;
-                            Expression::In(Box::new(In {
-                                this: left,
-                                expressions: Vec::new(),
-                                query: Some(subquery),
-                                not: true,
-                                global: global_in,
-                                unnest: None,
-                                is_field: false,
-                            }))
-                        } else if self.check(TokenType::RParen) {
-                            // Empty NOT IN set: NOT IN ()
-                            self.skip();
-                            Expression::In(Box::new(In {
-                                this: left,
-                                expressions: Vec::new(),
-                                query: None,
-                                not: true,
-                                global: global_in,
-                                unnest: None,
-                                is_field: false,
-                            }))
-                        } else {
-                            let expressions =
-                                self.with_parser_depth(|parser| parser.parse_expression_list())?;
-                            self.expect(TokenType::RParen)?;
-                            Expression::In(Box::new(In {
-                                this: left,
-                                expressions,
-                                query: None,
-                                not: true,
-                                global: global_in,
-                                unnest: None,
-                                is_field: false,
-                            }))
-                        }
+                        let (expressions, query) = self.parse_in_contents()?;
+                        Expression::In(Box::new(In {
+                            this: left,
+                            expressions,
+                            query,
+                            not: true,
+                            global: global_in,
+                            unnest: None,
+                            is_field: false,
+                        }))
                     } else {
                         // ClickHouse/DuckDB: IN without parentheses: expr NOT IN table_name
                         let table_expr = self.parse_primary()?;
@@ -31475,47 +31447,16 @@ impl Parser {
                         is_field: false,
                     }))
                 } else if self.match_token(TokenType::LParen) {
-                    // Standard IN (list) or IN (subquery)
-                    // Check if this is a subquery (IN (SELECT ...) or IN (WITH ... SELECT ...))
-                    if self.check(TokenType::Select) || self.check(TokenType::With) {
-                        // Use parse_statement to handle both SELECT and WITH...SELECT
-                        let subquery = self.parse_statement()?;
-                        self.expect(TokenType::RParen)?;
-                        Expression::In(Box::new(In {
-                            this: left,
-                            expressions: Vec::new(),
-                            query: Some(subquery),
-                            not: false,
-                            global: global_in,
-                            unnest: None,
-                            is_field: false,
-                        }))
-                    } else if self.check(TokenType::RParen) {
-                        // Empty IN set: IN ()
-                        self.skip();
-                        Expression::In(Box::new(In {
-                            this: left,
-                            expressions: Vec::new(),
-                            query: None,
-                            not: false,
-                            global: global_in,
-                            unnest: None,
-                            is_field: false,
-                        }))
-                    } else {
-                        let expressions =
-                            self.with_parser_depth(|parser| parser.parse_expression_list())?;
-                        self.expect(TokenType::RParen)?;
-                        Expression::In(Box::new(In {
-                            this: left,
-                            expressions,
-                            query: None,
-                            not: false,
-                            global: global_in,
-                            unnest: None,
-                            is_field: false,
-                        }))
-                    }
+                    let (expressions, query) = self.parse_in_contents()?;
+                    Expression::In(Box::new(In {
+                        this: left,
+                        expressions,
+                        query,
+                        not: false,
+                        global: global_in,
+                        unnest: None,
+                        is_field: false,
+                    }))
                 } else {
                     // DuckDB: IN without parentheses for array/list membership: 'red' IN tbl.flags
                     let expr = self.parse_bitwise_or()?;
@@ -61077,6 +61018,33 @@ impl Parser {
         })))
     }
 
+    /// Parses the contents of `IN (...)` after the opening parenthesis, consuming the closing one.
+    ///
+    /// Returns the value list, or the query when the contents are a `SELECT`/`WITH` query or a
+    /// lone set operation such as `(SELECT a) UNION (SELECT b)`.
+    fn parse_in_contents(&mut self) -> Result<(Vec<Expression>, Option<Expression>)> {
+        if self.check(TokenType::Select) || self.check(TokenType::With) {
+            let query = self.parse_statement()?;
+            self.expect(TokenType::RParen)?;
+            return Ok((Vec::new(), Some(query)));
+        }
+        if self.match_token(TokenType::RParen) {
+            return Ok((Vec::new(), None));
+        }
+        let capacity_hint = self.estimate_expression_list_capacity_until_rparen();
+        let mut expressions = self.with_parser_depth(|parser| {
+            parser.parse_expression_list_with_capacity(capacity_hint)
+        })?;
+        self.expect(TokenType::RParen)?;
+        if matches!(
+            expressions[..],
+            [Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)]
+        ) {
+            return Ok((Vec::new(), expressions.pop()));
+        }
+        Ok((expressions, None))
+    }
+
     /// parse_in_with_expr - Parses IN expression with given left side
     fn parse_in_with_expr(&mut self, this: Option<Expression>) -> Result<Expression> {
         let this_expr = match this {
@@ -61119,34 +61087,15 @@ impl Parser {
             return Err(self.parse_error("Expected expression or parenthesized list after IN"));
         }
 
-        // Check if it's a subquery
-        if self.check(TokenType::Select) {
-            let subquery = self.parse_select()?;
-            self.expect(TokenType::RParen)?;
-            return Ok(Expression::In(Box::new(In {
-                this: this_expr,
-                expressions: Vec::new(),
-                query: Some(subquery),
-                not: false,
-                global: false,
-                unnest: None,
-                is_field: false,
-            })));
-        }
-
-        // Parse value list. Pre-size for large IN lists to reduce reallocations.
-        let capacity_hint = self.estimate_expression_list_capacity_until_rparen();
-        let expressions = self.parse_expression_list_with_capacity(capacity_hint)?;
-        self.expect(TokenType::RParen)?;
-
-        if expressions.is_empty() {
+        let (expressions, query) = self.parse_in_contents()?;
+        if expressions.is_empty() && query.is_none() {
             return Err(self.parse_error("Expected expression list after IN"));
         }
 
         Ok(Expression::In(Box::new(In {
             this: this_expr,
             expressions,
-            query: None,
+            query,
             not: false,
             global: false,
             unnest: None,
@@ -69042,6 +68991,146 @@ OPTIONS (
         );
     }
 
+    fn where_in(sql: &str) -> In {
+        let ast = Parser::parse_sql(&format!("SELECT * FROM t WHERE {sql}")).unwrap();
+        let Expression::Select(select) = &ast[0] else {
+            panic!("expected SELECT for '{sql}'");
+        };
+        match select.where_clause.as_ref().map(|w| &w.this) {
+            Some(Expression::In(in_expr)) => (**in_expr).clone(),
+            other => panic!("expected IN for '{sql}', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_in_parenthesized_set_operation_is_a_query() {
+        for (sql, not) in [
+            ("x IN ((SELECT a FROM u) UNION (SELECT b FROM v))", false),
+            ("x NOT IN ((SELECT a FROM u) UNION (SELECT b FROM v))", true),
+            (
+                "x IN ((SELECT a FROM u) INTERSECT (SELECT b FROM v))",
+                false,
+            ),
+            ("x IN ((SELECT a FROM u) EXCEPT (SELECT b FROM v))", false),
+        ] {
+            let in_expr = where_in(sql);
+            assert!(in_expr.expressions.is_empty(), "{sql}");
+            assert_eq!(in_expr.not, not, "{sql}");
+            assert!(
+                matches!(
+                    in_expr.query,
+                    Some(Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_))
+                ),
+                "{sql}: {:?}",
+                in_expr.query
+            );
+        }
+    }
+
+    #[test]
+    fn test_in_single_parenthesized_query_stays_a_list_item() {
+        let in_expr = where_in("x IN ((SELECT 1))");
+        assert!(in_expr.query.is_none());
+        assert!(matches!(in_expr.expressions[..], [Expression::Subquery(_)]));
+    }
+
+    #[test]
+    fn test_in_parenthesized_query_with_other_items_stays_a_list() {
+        let in_expr = where_in("x IN ((SELECT 1), 2)");
+        assert!(in_expr.query.is_none());
+        assert_eq!(in_expr.expressions.len(), 2);
+
+        let in_expr = where_in("x IN ((SELECT 1) UNION (SELECT 2), 3)");
+        assert!(in_expr.query.is_none());
+        assert_eq!(in_expr.expressions.len(), 2);
+    }
+
+    #[test]
+    fn test_in_parenthesized_set_operation_roundtrip() {
+        use crate::dialects::{Dialect, DialectType};
+
+        for sql in [
+            "SELECT * FROM t WHERE x IN ((SELECT a FROM u) UNION (SELECT b FROM v))",
+            "SELECT * FROM t WHERE x IN ((SELECT a FROM u) UNION ALL (SELECT b FROM v))",
+            "SELECT * FROM t WHERE x IN ((SELECT a FROM u) INTERSECT (SELECT b FROM v))",
+            "SELECT * FROM t WHERE x IN ((SELECT 1))",
+            "SELECT * FROM t WHERE x IN ((SELECT 1), 2)",
+            "SELECT * FROM t WHERE x IN ((SELECT 1) /* c */ UNION (SELECT 2))",
+        ] {
+            for dialect_type in [
+                DialectType::Trino,
+                DialectType::PostgreSQL,
+                DialectType::Generic,
+            ] {
+                let dialect = Dialect::get(dialect_type);
+                let ast = dialect.parse(sql).unwrap();
+                assert_eq!(dialect.generate(&ast[0]).unwrap(), sql, "{dialect_type:?}");
+            }
+        }
+
+        let not_in = "SELECT * FROM t WHERE x NOT IN ((SELECT a FROM u) UNION (SELECT b FROM v))";
+        for dialect_type in [DialectType::Trino, DialectType::PostgreSQL] {
+            let dialect = Dialect::get(dialect_type);
+            let ast = dialect.parse(not_in).unwrap();
+            assert_eq!(
+                dialect.generate(&ast[0]).unwrap(),
+                not_in,
+                "{dialect_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_in_parenthesized_set_operation_pretty() {
+        let ast = Parser::parse_sql(
+            "SELECT * FROM t WHERE x IN ((SELECT a FROM u) UNION (SELECT b FROM v))",
+        )
+        .unwrap();
+        assert_eq!(
+            crate::generator::Generator::pretty_sql(&ast[0]).unwrap(),
+            "SELECT\n  *\nFROM t\nWHERE\n  x IN (\n    (\n      SELECT\n        a\n      FROM u\n    )\n    UNION\n    (\n      SELECT\n        b\n      FROM v\n    )\n  );"
+        );
+    }
+
+    #[test]
+    fn test_snowflake_not_in_parenthesized_set_operation() {
+        use crate::dialects::{Dialect, DialectType};
+
+        for source in [
+            DialectType::Snowflake,
+            DialectType::Generic,
+            DialectType::Trino,
+        ] {
+            let out = Dialect::get(source)
+                .transpile(
+                    "SELECT * FROM t WHERE x NOT IN ((SELECT a FROM u) UNION (SELECT b FROM v))",
+                    DialectType::Snowflake,
+                )
+                .unwrap();
+            assert_eq!(
+                out,
+                ["SELECT * FROM t WHERE x <> ALL ((SELECT a FROM u) UNION (SELECT b FROM v))"],
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_in_with_expr_accepts_with_query() {
+        let mut parser = Parser::new(
+            Tokenizer::default()
+                .tokenize("(WITH c AS (SELECT 1) SELECT * FROM c)")
+                .unwrap(),
+        );
+        let Expression::In(in_expr) = parser
+            .parse_in_with_expr(Some(Expression::column("x")))
+            .unwrap()
+        else {
+            panic!("expected IN");
+        };
+        assert!(matches!(in_expr.query, Some(Expression::Select(_))));
+    }
+
     #[test]
     fn test_xmlelement_basic() {
         assert_roundtrip("SELECT XMLELEMENT(NAME foo)");
@@ -70081,6 +70170,18 @@ mod termination_tests {
             .collect();
         let chains: Vec<&str> = chains.iter().map(String::as_str).collect();
         assert_all(&chains, Decision::Rejected, "a malformed 24-link IF chain");
+    }
+
+    /// A value list that starts with `(` used to be parsed twice, once as a possible set
+    /// operation and once as a list, so cost doubled per nesting level.
+    #[test]
+    fn test_nested_in_lists_are_parsed_within_budget() {
+        let sql = format!(
+            "SELECT * FROM t WHERE x IN ({}1{})",
+            "(x IN (".repeat(20),
+            "))".repeat(20)
+        );
+        assert_all(&[&sql], Decision::Parsed, "a 20-deep nested IN list");
     }
 
     #[test]
