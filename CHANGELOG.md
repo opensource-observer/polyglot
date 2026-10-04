@@ -32,6 +32,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   breaks the set operation across lines like any `IN (SELECT ...)`, and
   Snowflake renders `NOT IN` over a set operation as `<> ALL (...)`, as it
   already does for `NOT IN (SELECT ...)`.
+- A scalar subquery inside an expression no longer absorbs a following
+  `UNION`, `INTERSECT`, or `EXCEPT`. In
+  `SELECT a, (SELECT 1 FROM u) UNION ALL SELECT b, 2 FROM v` the set operation
+  now applies to the whole statement, so scope analysis sees both branches.
+  Generated SQL for this shape is corrected too: SQLite no longer emits invalid
+  SQL, and T-SQL `TOP` and ClickHouse `ORDER BY`/`LIMIT` now apply to the whole
+  set operation. Parenthesized set operations used as values, such as
+  `SELECT ((SELECT 1) UNION (SELECT 2))`, parse as before.
 
 ## [0.13.1] - 2026-09-30
 

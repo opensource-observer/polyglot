@@ -10730,7 +10730,7 @@ impl Parser {
     fn parse_connect_primary(&mut self) -> Result<Expression> {
         // Handle PRIOR as prefix operator
         if self.match_token(TokenType::Prior) {
-            let expr = self.parse_primary()?;
+            let expr = self.parse_operand_primary()?;
             return Ok(Expression::Prior(Box::new(Prior { this: expr })));
         }
 
@@ -10738,7 +10738,7 @@ impl Parser {
             return Ok(connect_by_root);
         }
 
-        self.parse_primary()
+        self.parse_operand_primary()
     }
 
     /// Parse Oracle CONNECT_BY_ROOT in either supported form:
@@ -32538,7 +32538,7 @@ impl Parser {
             if let Some(type_cast) = self.try_parse_type_shorthand_cast()? {
                 return self.parse_postfix_operators(type_cast);
             }
-            let expr = self.parse_primary()?;
+            let expr = self.parse_operand_primary()?;
             // Handle postfix exclamation mark for Snowflake model attribute syntax: model!PREDICT(...)
             self.parse_postfix_operators(expr)
         }
@@ -33302,8 +33302,16 @@ impl Parser {
         }
     }
 
-    fn parse_parenthesized_primary(&mut self, lparen_comments: Vec<String>) -> Result<Expression> {
+    fn parse_parenthesized_primary(
+        &mut self,
+        lparen_comments: Vec<String>,
+        as_operand: bool,
+    ) -> Result<Expression> {
         let raw_start = self.previous().span.start;
+        // An operand that leads an enclosing parenthesis, as in `((SELECT 1) UNION (SELECT 2))`,
+        // is still followed by that parenthesis's own set operation.
+        let continues_set_operation = !as_operand
+            || (self.current >= 2 && self.tokens[self.current - 2].token_type == TokenType::LParen);
 
         // Empty parens () — could be empty tuple or zero-param lambda () -> body
         if self.check(TokenType::RParen) {
@@ -33503,7 +33511,11 @@ impl Parser {
                 }))
             };
 
-            let set_result = self.parse_set_operation(subquery)?;
+            let set_result = if continues_set_operation {
+                self.parse_set_operation(subquery)?
+            } else {
+                subquery
+            };
             let had_set_operation = matches!(
                 &set_result,
                 Expression::Union(_) | Expression::Intersect(_) | Expression::Except(_)
@@ -33600,9 +33612,10 @@ impl Parser {
             self.expect(TokenType::RParen)?;
             let mut nested_paren_comments = lparen_comments.clone();
             nested_paren_comments.extend_from_slice(self.previous_trailing_comments());
-            if self.check(TokenType::Union)
-                || self.check(TokenType::Intersect)
-                || self.check(TokenType::Except)
+            if continues_set_operation
+                && (self.check(TokenType::Union)
+                    || self.check(TokenType::Intersect)
+                    || self.check(TokenType::Except))
             {
                 if let Expression::Subquery(subq) = &result {
                     let set_result = self.parse_set_operation(subq.this.clone())?;
@@ -34273,11 +34286,17 @@ impl Parser {
     /// Parse primary expressions
     #[inline(always)]
     fn parse_primary(&mut self) -> Result<Expression> {
-        self.with_parser_depth(|parser| parser.parse_primary_inner())
+        self.with_parser_depth(|parser| parser.parse_primary_inner(false))
+    }
+
+    /// Parse a primary as an operand of the expression grammar, where a parenthesized query is
+    /// a scalar subquery and a set operator after it belongs to the enclosing query.
+    fn parse_operand_primary(&mut self) -> Result<Expression> {
+        self.with_parser_depth(|parser| parser.parse_primary_inner(true))
     }
 
     #[inline(never)]
-    fn parse_primary_inner(&mut self) -> Result<Expression> {
+    fn parse_primary_inner(&mut self, as_operand: bool) -> Result<Expression> {
         // Public fragment parsers can reach this path without the statement-level
         // empty-input checks, including after a leading EOF has been normalized away.
         if self.tokens.is_empty() {
@@ -34330,7 +34349,7 @@ impl Parser {
             self.if_expr_ruled_out.insert(saved_pos);
         }
 
-        self.parse_primary_slow()
+        self.parse_primary_slow(as_operand)
     }
 
     fn parse_bigquery_parameter(&mut self) -> Result<Expression> {
@@ -34367,7 +34386,7 @@ impl Parser {
     }
 
     #[inline(never)]
-    fn parse_primary_slow(&mut self) -> Result<Expression> {
+    fn parse_primary_slow(&mut self, as_operand: bool) -> Result<Expression> {
         if self.config.dialect == Some(crate::dialects::DialectType::HANA)
             && !self.check(TokenType::QuotedIdentifier)
             && !self.check_next(TokenType::Dot)
@@ -34751,7 +34770,7 @@ impl Parser {
         // Parenthesized expression or subquery
         if self.match_token(TokenType::LParen) {
             let lparen_comments = self.previous_trailing_comments().to_vec();
-            return self.parse_parenthesized_primary(lparen_comments);
+            return self.parse_parenthesized_primary(lparen_comments, as_operand);
         }
 
         // NULL

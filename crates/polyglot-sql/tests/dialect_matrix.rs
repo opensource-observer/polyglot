@@ -6209,3 +6209,277 @@ mod compound_row_limit_regressions {
         }
     }
 }
+
+mod scalar_subquery_set_operation_regressions {
+    use super::*;
+    use polyglot_sql::{build_scope, Expression, ExpressionWalk};
+    use DialectType::*;
+
+    const DIALECTS: [DialectType; 3] = [Generic, PostgreSQL, Trino];
+
+    fn parse_one(sql: &str, dialect: DialectType) -> Expression {
+        let mut statements = Dialect::get(dialect)
+            .parse(sql)
+            .unwrap_or_else(|e| panic!("{dialect:?} failed to parse {sql}: {e}"));
+        assert_eq!(statements.len(), 1, "{sql}");
+        statements.remove(0)
+    }
+
+    fn assert_round_trips(sql: &str) {
+        for dialect in DIALECTS {
+            assert_eq!(transpile(sql, dialect, dialect), sql, "{dialect:?}");
+        }
+    }
+
+    fn set_operation_branches(expr: &Expression) -> (&'static str, &Expression, &Expression) {
+        match expr {
+            Expression::Union(op) => ("UNION", &op.left, &op.right),
+            Expression::Intersect(op) => ("INTERSECT", &op.left, &op.right),
+            Expression::Except(op) => ("EXCEPT", &op.left, &op.right),
+            other => panic!("expected a set operation, got {other:?}"),
+        }
+    }
+
+    fn projection(expr: &Expression) -> &[Expression] {
+        match expr {
+            Expression::Select(select) => &select.expressions,
+            other => panic!("expected a SELECT branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_subquery_leaves_set_operator_to_enclosing_query() {
+        let cases = [
+            (
+                "SELECT a, (SELECT 1 FROM u) UNION ALL SELECT b, 2 FROM v",
+                "UNION",
+                1,
+            ),
+            (
+                "SELECT a, (SELECT 1 FROM u) INTERSECT SELECT b, 2 FROM v",
+                "INTERSECT",
+                1,
+            ),
+            (
+                "SELECT a, (SELECT 1 FROM u) EXCEPT SELECT b, 2 FROM v",
+                "EXCEPT",
+                1,
+            ),
+            (
+                "SELECT (SELECT 1 FROM u), a FROM w UNION ALL SELECT 2, b FROM v",
+                "UNION",
+                0,
+            ),
+            (
+                "SELECT a, (SELECT 1 FROM u), c FROM w UNION SELECT b, 2, d FROM v",
+                "UNION",
+                1,
+            ),
+        ];
+        for (sql, kind, subquery_index) in cases {
+            for dialect in DIALECTS {
+                let expr = parse_one(sql, dialect);
+                let (actual_kind, left, right) = set_operation_branches(&expr);
+                assert_eq!(actual_kind, kind, "{dialect:?}: {sql}");
+
+                let left = projection(left);
+                for (i, item) in left.iter().enumerate() {
+                    assert_eq!(
+                        matches!(item, Expression::Subquery(s) if matches!(s.this, Expression::Select(_))),
+                        i == subquery_index,
+                        "{dialect:?}: {sql}: item {i} is {item:?}"
+                    );
+                }
+                assert_eq!(projection(right).len(), left.len(), "{dialect:?}: {sql}");
+            }
+            assert_round_trips(sql);
+        }
+    }
+
+    #[test]
+    fn trailing_modifiers_bind_to_enclosing_set_operation() {
+        let sql = "SELECT a, (SELECT 1 FROM u) UNION ALL SELECT b, 2 FROM v ORDER BY 1 LIMIT 5";
+        for dialect in DIALECTS {
+            let Expression::Union(union) = parse_one(sql, dialect) else {
+                panic!("{dialect:?}: expected UNION");
+            };
+            assert!(union.order_by.is_some(), "{dialect:?}");
+            assert!(union.limit.is_some(), "{dialect:?}");
+            assert!(matches!(
+                projection(&union.left)[1],
+                Expression::Subquery(_)
+            ));
+        }
+        assert_round_trips(sql);
+    }
+
+    #[test]
+    fn scalar_subquery_in_where_leaves_set_operator_to_enclosing_query() {
+        let sql = "SELECT a FROM w WHERE a = (SELECT 1 FROM u) UNION SELECT b FROM v";
+        for dialect in DIALECTS {
+            let expr = parse_one(sql, dialect);
+            let (kind, left, _) = set_operation_branches(&expr);
+            assert_eq!(kind, "UNION", "{dialect:?}");
+            assert!(matches!(left, Expression::Select(_)), "{dialect:?}");
+        }
+        assert_round_trips(sql);
+    }
+
+    #[test]
+    fn doubly_parenthesized_scalar_subquery_leaves_set_operator_to_enclosing_query() {
+        let sql = "SELECT ((SELECT 1)) UNION SELECT 2";
+        for dialect in DIALECTS {
+            let expr = parse_one(sql, dialect);
+            let (kind, left, _) = set_operation_branches(&expr);
+            assert_eq!(kind, "UNION", "{dialect:?}");
+            assert!(
+                matches!(&projection(left)[0], Expression::Paren(p) if matches!(p.this, Expression::Subquery(_))),
+                "{dialect:?}"
+            );
+        }
+        assert_round_trips(sql);
+    }
+
+    #[test]
+    fn connect_by_scalar_subquery_leaves_set_operator_to_enclosing_query() {
+        let query =
+            "SELECT a FROM t CONNECT BY PRIOR a = (SELECT 1 FROM dual) UNION SELECT 2 FROM dual";
+        let assert_union_of_hierarchical_query = |expr: &Expression| {
+            let (kind, left, _) = set_operation_branches(expr);
+            assert_eq!(kind, "UNION");
+            let Expression::Select(select) = left else {
+                panic!("expected a SELECT branch, got {left:?}");
+            };
+            assert!(matches!(
+                select.connect.as_ref().map(|c| &c.connect),
+                Some(Expression::Eq(eq)) if matches!(eq.right, Expression::Subquery(_))
+            ));
+        };
+        assert_union_of_hierarchical_query(&parse_one(query, Oracle));
+
+        let nested = format!("SELECT * FROM u WHERE EXISTS({query})");
+        let Expression::Select(outer) = parse_one(&nested, Oracle) else {
+            panic!("expected a SELECT statement");
+        };
+        let Some(Expression::Exists(exists)) = outer.where_clause.as_ref().map(|w| &w.this) else {
+            panic!("expected EXISTS in WHERE");
+        };
+        assert_union_of_hierarchical_query(&exists.this);
+
+        for sql in [query, nested.as_str()] {
+            assert_eq!(transpile(sql, Oracle, Oracle), sql);
+        }
+    }
+
+    #[test]
+    fn operand_context_does_not_reach_nested_primaries() {
+        let is_expression = |sql: &str, dialect: DialectType| {
+            parse_one(sql, dialect)
+                .find(|e| matches!(e, Expression::Is(_)))
+                .cloned()
+                .unwrap_or_else(|| panic!("{dialect:?}: no IS in {sql}"))
+        };
+        for dialect in DIALECTS {
+            assert_eq!(
+                is_expression("SELECT f(x IS (SELECT 1) UNION SELECT 2)", dialect),
+                is_expression("SELECT x IS (SELECT 1) UNION SELECT 2", dialect),
+                "{dialect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parenthesized_set_operation_values_are_unchanged() {
+        for (sql, kind) in [
+            ("SELECT ((SELECT 1) UNION (SELECT 2))", "UNION"),
+            (
+                "SELECT ((SELECT 1) INTERSECT (SELECT 2) ORDER BY 1 LIMIT 1)",
+                "INTERSECT",
+            ),
+        ] {
+            for dialect in DIALECTS {
+                let expr = parse_one(sql, dialect);
+                let Expression::Paren(paren) = &projection(&expr)[0] else {
+                    panic!("{dialect:?}: expected a parenthesized value in {expr:?}");
+                };
+                assert_eq!(set_operation_branches(&paren.this).0, kind, "{dialect:?}");
+            }
+            assert_round_trips(sql);
+        }
+
+        let sql = "SELECT EXISTS((SELECT 1) EXCEPT (SELECT 2))";
+        for dialect in DIALECTS {
+            let expr = parse_one(sql, dialect);
+            let Expression::Exists(exists) = &projection(&expr)[0] else {
+                panic!("{dialect:?}: expected EXISTS in {expr:?}");
+            };
+            assert_eq!(
+                set_operation_branches(&exists.this).0,
+                "EXCEPT",
+                "{dialect:?}"
+            );
+        }
+        assert_round_trips(sql);
+
+        let sql = "SELECT * FROM t WHERE x IN ((SELECT 1) UNION (SELECT 2))";
+        for dialect in DIALECTS {
+            let Expression::Select(select) = parse_one(sql, dialect) else {
+                panic!("{dialect:?}: expected a SELECT statement");
+            };
+            let Some(Expression::In(in_expr)) = select.where_clause.as_ref().map(|w| &w.this)
+            else {
+                panic!("{dialect:?}: expected IN in WHERE");
+            };
+            assert!(
+                in_expr
+                    .query
+                    .iter()
+                    .chain(&in_expr.expressions)
+                    .any(|e| matches!(e, Expression::Union(_))),
+                "{dialect:?}: {in_expr:?}"
+            );
+        }
+        assert_round_trips(sql);
+
+        let sql = "(SELECT 1) UNION (SELECT 2)";
+        for dialect in DIALECTS {
+            let expr = parse_one(sql, dialect);
+            let (kind, left, right) = set_operation_branches(&expr);
+            assert_eq!(kind, "UNION", "{dialect:?}");
+            assert!(matches!(left, Expression::Subquery(_)), "{dialect:?}");
+            assert!(matches!(right, Expression::Subquery(_)), "{dialect:?}");
+        }
+        assert_round_trips(sql);
+
+        let sql = "CREATE TABLE t AS (SELECT 1) UNION (SELECT 2)";
+        for dialect in DIALECTS {
+            let Expression::CreateTable(create) = parse_one(sql, dialect) else {
+                panic!("{dialect:?}: expected CREATE TABLE");
+            };
+            let Some(Expression::Union(union)) = &create.as_select else {
+                panic!(
+                    "{dialect:?}: expected a UNION body, got {:?}",
+                    create.as_select
+                );
+            };
+            assert!(matches!(union.left, Expression::Subquery(_)), "{dialect:?}");
+            assert!(
+                matches!(union.right, Expression::Subquery(_)),
+                "{dialect:?}"
+            );
+        }
+        assert_round_trips(sql);
+    }
+
+    #[test]
+    fn scope_sees_scalar_subquery_in_left_branch() {
+        let expr = parse_one(
+            "SELECT a, (SELECT 1 FROM u) UNION ALL SELECT b, 2 FROM v",
+            Generic,
+        );
+        let scope = build_scope(&expr);
+        assert_eq!(scope.union_scopes.len(), 2);
+        assert_eq!(scope.union_scopes[0].subquery_scopes.len(), 1);
+        assert!(scope.union_scopes[1].subquery_scopes.is_empty());
+    }
+}
