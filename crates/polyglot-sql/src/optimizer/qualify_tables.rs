@@ -690,6 +690,16 @@ mod tests {
     }
 
     #[test]
+    fn test_generated_aliases_avoid_aliases_inside_derived_tables() {
+        let expr = parse("SELECT * FROM (SELECT * FROM (SELECT 1 AS a) AS _0), (SELECT 2 AS b)");
+        let sql = gen(&qualify_tables(expr, &QualifyTablesOptions::new()));
+        assert_eq!(
+            sql,
+            "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) AS _0) AS _1, (SELECT 2 AS b) AS _2"
+        );
+    }
+
+    #[test]
     fn test_qualify_with_db() {
         let options = QualifyTablesOptions::new().with_db("mydb");
         let expr = parse("SELECT * FROM users");
