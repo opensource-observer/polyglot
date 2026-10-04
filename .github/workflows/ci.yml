@@ -2,10 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, oso-main]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, oso-main]
 
 permissions:
   contents: read
