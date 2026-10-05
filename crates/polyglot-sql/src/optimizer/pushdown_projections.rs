@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dialects::DialectType;
 use crate::expressions::{AggregateFunction, Alias, Expression, Identifier, Literal};
-use crate::scope::{build_scope, traverse_scope, Scope};
+use crate::scope::{build_scope, Scope};
 
 /// Sentinel value indicating all columns are selected
 const SELECT_ALL: &str = "__SELECT_ALL__";
@@ -38,16 +38,14 @@ pub fn pushdown_projections(
     _dialect: Option<DialectType>,
     remove_unused_selections: bool,
 ) -> Expression {
-    let _root = build_scope(&expression);
+    let root = build_scope(&expression);
 
     // Map of scope to columns being selected by outer queries
     let mut referenced_columns: HashMap<u64, HashSet<String>> = HashMap::new();
     let source_column_alias_count: HashMap<u64, usize> = HashMap::new();
 
     // Collect all scopes and process in reverse order (bottom-up)
-    let scopes = traverse_scope(&expression);
-
-    for scope in scopes.iter().rev() {
+    for scope in root.traverse().into_iter().rev() {
         let scope_id = scope as *const Scope as u64;
         let parent_selections = referenced_columns
             .get(&scope_id)
@@ -79,7 +77,7 @@ pub fn pushdown_projections(
         };
 
         // Handle set operations (UNION, INTERSECT, EXCEPT)
-        process_set_operations(&scope, &parent_selections, &mut referenced_columns);
+        process_set_operations(scope, &parent_selections, &mut referenced_columns);
 
         // Handle SELECT statements
         if let Expression::Select(ref select) = scope.expression {
@@ -110,7 +108,7 @@ pub fn pushdown_projections(
                 let columns = selects.get(source_name).cloned().unwrap_or_default();
 
                 // Find the child scope for this source
-                for child_scope in collect_child_scopes(&scope) {
+                for child_scope in collect_child_scopes(scope) {
                     let child_id = child_scope as *const Scope as u64;
                     referenced_columns
                         .entry(child_id)

@@ -13,7 +13,7 @@ use crate::expressions::{
 use crate::resolver::{Resolver, ResolverError};
 use crate::schema::{normalize_name, Schema};
 use crate::scope::{
-    build_scope_with_ctes, selected_reference_scope, traverse_scope, NoopScopeVisitor, Scope,
+    build_scope, build_scope_with_ctes, selected_reference_scope, NoopScopeVisitor, Scope,
     SourceInfo, SourceKind,
 };
 use std::cell::RefCell;
@@ -394,14 +394,14 @@ fn qualify_query_inner(
 pub fn validate_qualify_columns(expression: &Expression) -> QualifyColumnsResult<()> {
     let mut all_unqualified = Vec::new();
 
-    for scope in traverse_scope(expression) {
+    for scope in build_scope(expression).traverse() {
         if let Expression::Select(_) = &scope.expression {
             // Get unqualified columns from this scope
-            let unqualified = get_unqualified_columns(&scope);
+            let unqualified = get_unqualified_columns(scope);
 
             // Check for external columns that couldn't be resolved
-            let external = get_external_columns(&scope);
-            if !external.is_empty() && !is_correlated_subquery(&scope) {
+            let external = get_external_columns(scope);
+            if !external.is_empty() && !is_correlated_subquery(scope) {
                 let first = &external[0];
                 let for_table = if first.table.is_some() {
                     format!(" for table: '{}'", first.table.as_ref().unwrap())

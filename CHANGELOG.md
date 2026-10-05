@@ -24,6 +24,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- `qualify_tables`, `validate_qualify_columns` and `pushdown_projections` no
+  longer deep-clone every scope through `traverse_scope`. That made memory use
+  grow roughly cubically with derived-table nesting depth (`qualify_tables` on
+  a 120-deep query used about 3.7 GB). They now borrow the scopes from
+  `build_scope(..).traverse()`. `traverse_scope` keeps its signature and now
+  documents that it clones each scope.
 - `Scope::traverse` and `traverse_scope` now yield derived-table scopes in
   post-order. Previously they walked the never-populated `table_scopes`, so
   `traverse_scope("SELECT a FROM (SELECT b FROM t) x")` returned only the root
