@@ -24,6 +24,16 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- `build_scope` now registers the relations inside a parenthesized join FROM
+  item, such as `(a JOIN b ON ...)`, instead of leaving them out of
+  `Scope::sources`, so their columns resolve and qualify. An unaliased
+  parenthesized join registers each relation in the enclosing scope, nested
+  joins included, and a later `LATERAL` item sees them. An aliased one,
+  `(a JOIN b) AS j`, registers only `j`, since the alias hides the names
+  inside it. Subqueries in the conditions of the inner joins now get subquery
+  scopes. `ScopeVisitor::reference` reports the items inside a parenthesized
+  join at `depth + 1`, before the join itself, instead of reporting the join's
+  contents through `skipped`.
 - `build_scope` now gives a subquery scope to a query in an expression field
   the scope walk skipped: an aggregate's `FILTER (WHERE ...)`, `ORDER BY` and
   `LIMIT`, a window frame bound, a `CAST` `FORMAT` or `DEFAULT` expression,
