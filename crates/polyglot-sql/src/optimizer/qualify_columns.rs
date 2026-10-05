@@ -3229,6 +3229,16 @@ mod tests {
             gen(&qualified),
             "SELECT t.x AS x, g.y AS y FROM t, MY_FUNC(t.x) AS g(y)"
         );
+
+        // Without a column list the function's columns are unknown, but a
+        // reference qualified with its alias still resolves.
+        let sql = "SELECT x, g.z FROM t, my_func(t.x) AS g";
+        let qualified =
+            qualify_columns(parse(sql), &schema, &QualifyColumnsOptions::new()).unwrap();
+        assert_eq!(
+            gen(&qualified),
+            "SELECT t.x AS x, g.z AS z FROM t, MY_FUNC(t.x) AS g"
+        );
     }
 
     #[test]

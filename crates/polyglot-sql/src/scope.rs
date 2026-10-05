@@ -774,8 +774,10 @@ pub trait ScopeVisitor {
     /// items inside it: they are still built and reported, with
     /// `registered_as` set to the name each binds inside the join, but they
     /// add no entry to [`Scope::sources`], so for them `registered_as` is not
-    /// a key into it. An aliased `MATCH_RECOGNIZE` hides its input relation
-    /// the same way.
+    /// a key into it. An aliased `MATCH_RECOGNIZE` is registered as its alias
+    /// and hides its input relation the same way: the input is reported at
+    /// `depth + 1` before the `MATCH_RECOGNIZE` itself. An unaliased one is
+    /// reported whole through `skipped`.
     fn reference(
         &mut self,
         _scope: ScopeId,
@@ -790,9 +792,10 @@ pub trait ScopeVisitor {
     /// Called for each subtree of a FROM item that gets no scope and is not
     /// searched for subqueries, such as table-function and `UNNEST`
     /// arguments, `VALUES` row values, `LATERAL` calls, `PIVOT` clauses and
-    /// table sample or time-travel arguments, and the join conditions inside
-    /// an aliased parenthesized join. An item the builder does not handle at
-    /// all is reported whole.
+    /// table sample or time-travel arguments, the clauses of an aliased
+    /// `MATCH_RECOGNIZE`, and the join conditions behind an alias, such as
+    /// those inside an aliased parenthesized join. An item the builder does
+    /// not handle at all is reported whole.
     ///
     /// The values of a `VALUES` body that becomes a scope (a derived table,
     /// CTE body, root or set-operation branch) are reported against that
@@ -1075,7 +1078,10 @@ fn add_from_item(
     } else if let Expression::MatchRecognize(match_recognize) = item {
         let name = add_match_recognize_to_scope(
             item,
-            (match_recognize.this.as_deref(), match_recognize.alias.as_ref()),
+            (
+                match_recognize.this.as_deref(),
+                match_recognize.alias.as_ref(),
+            ),
             depth,
             next_index,
             scope,
@@ -1150,6 +1156,8 @@ fn add_joined_table_to_scope(
     Some(alias.name.clone())
 }
 
+/// Registers the relations and lateral views of `joined` one depth below
+/// `depth`.
 fn add_join_items(
     joined: &JoinedTable,
     depth: usize,
@@ -1205,6 +1213,10 @@ fn add_match_recognize_to_scope(
                 preceding_sources,
                 builder,
             );
+            // As in an aliased join, these conditions may use hidden names.
+            if let Some((joined, None)) = parenthesized_join(input) {
+                for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
+            }
         });
     }
     builder.skip_children(scope, item, &["this"]);
@@ -1215,8 +1227,8 @@ fn add_match_recognize_to_scope(
     Some(alias.name.clone())
 }
 
-/// Runs `register`, then drops the names it added to `scope` and restores any
-/// enclosing ones they displaced.
+/// Runs `register`, then restores `scope.sources` and `preceding_sources` to
+/// what they were before it, so the names it registered are hidden again.
 ///
 /// The relations behind an alias are registered as usual first, so that they
 /// see each other, and the items before them, as LATERAL inputs.
@@ -2770,18 +2782,76 @@ mod tests {
                    DEFINE B AS B.v > PREV(B.v)) AS m";
         for dialect in [Snowflake, Oracle] {
             let (scope, recorder) = record(sql, dialect);
-            assert_eq!(sorted_keys(&scope.sources), ["m"]);
+            assert_eq!(sorted_keys(&scope.sources), ["m"], "{sql}");
             let source = &scope.sources["m"];
             assert_eq!(
                 (source.kind, source.is_scope),
-                (SourceKind::DerivedTable, false)
+                (SourceKind::DerivedTable, false),
+                "{sql}"
             );
             assert_eq!(
                 from_items(&recorder),
-                [(1, 1, Some("t")), (0, 0, Some("m"))]
+                [(1, 1, Some("t")), (0, 0, Some("m"))],
+                "{sql}"
             );
-            assert!(!recorder.skipped.is_empty());
+            // PARTITION BY, ORDER BY, MEASURES and DEFINE, but not the input.
+            assert_eq!(recorder.skipped.len(), 4, "{sql}");
+            assert!(
+                !recorder
+                    .skipped
+                    .iter()
+                    .any(|skipped| matches!(skipped, Expression::Table(_))),
+                "{sql}"
+            );
         }
+
+        // The input hides an earlier source of its name only inside the item.
+        let (scope, recorder) = record(
+            "SELECT * FROM s.x, x MATCH_RECOGNIZE (ORDER BY v PATTERN (A) \
+             DEFINE A AS TRUE) AS m",
+            Snowflake,
+        );
+        assert_eq!(sorted_keys(&scope.sources), ["m", "x"]);
+        assert!(matches!(
+            &scope.sources["x"].expression,
+            Expression::Table(table) if table.schema.is_some()
+        ));
+        assert_eq!(
+            from_items(&recorder),
+            [(0, 0, Some("x")), (2, 1, Some("x")), (1, 0, Some("m"))]
+        );
+
+        // A parenthesized join input: its condition may use the hidden names,
+        // so it is reported as skipped rather than scoped.
+        let (scope, recorder) = record(
+            "SELECT * FROM (a JOIN b ON a.k IN (SELECT k FROM s)) \
+             MATCH_RECOGNIZE (ORDER BY v PATTERN (A) DEFINE A AS TRUE) AS m",
+            Snowflake,
+        );
+        assert_eq!(sorted_keys(&scope.sources), ["m"]);
+        assert!(scope.subquery_scopes.is_empty());
+        assert_eq!(
+            from_items(&recorder),
+            [
+                (2, 2, Some("a")),
+                (3, 2, Some("b")),
+                (1, 1, None),
+                (0, 0, Some("m")),
+            ]
+        );
+        assert!(recorder
+            .skipped
+            .iter()
+            .any(|skipped| matches!(skipped, Expression::In(_))));
+
+        // An unaliased MATCH_RECOGNIZE is still reported whole.
+        let (scope, recorder) = record(
+            "SELECT * FROM t MATCH_RECOGNIZE (ORDER BY v PATTERN (A) DEFINE A AS TRUE)",
+            Snowflake,
+        );
+        assert!(scope.sources.is_empty());
+        assert_eq!(from_items(&recorder), [(0, 0, None)]);
+        assert_eq!(recorder.skipped.len(), 1);
 
         // The input's name stays hidden from a LATERAL item after it.
         let (scope, _) = record(
