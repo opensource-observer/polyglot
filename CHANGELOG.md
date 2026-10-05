@@ -11,8 +11,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - Rust `build_scope_with(expr, &mut visitor)` builds the same scope tree as
   `build_scope` while reporting its construction to an observe-only
   `ScopeVisitor`: scope entry and exit, each FROM/JOIN item in source order,
-  and the FROM-item subtrees that get no scope. Every scope a build creates
-  has a `ScopeId`, exposed as `Scope::id()`.
+  and the FROM-item subtrees that get no scope. A parenthesized join is
+  reported as an item, followed by its inner items at `depth + 1`. Every scope
+  a build creates has a `ScopeId`, exposed as `Scope::id()`.
 
 ### Fixed
 
@@ -32,6 +33,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   breaks the set operation across lines like any `IN (SELECT ...)`, and
   Snowflake renders `NOT IN` over a set operation as `<> ALL (...)`, as it
   already does for `NOT IN (SELECT ...)`.
+- Scope building now registers the tables and derived tables inside an
+  unaliased parenthesized join, such as `FROM (a JOIN b ON ...) JOIN c`, as if
+  the join were not parenthesized, including nested parentheses, subqueries in
+  the inner `ON` clauses and `LATERAL` items that follow earlier inner tables.
+  Previously only `c` was registered.
+- A `MATCH_RECOGNIZE` FROM item is now registered like `PIVOT`: as one derived
+  source named after its alias, or else after its input, with a scope for a
+  derived-table input. Previously it registered no source.
 
 ## [0.13.1] - 2026-09-30
 

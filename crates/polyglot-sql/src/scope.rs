@@ -729,14 +729,13 @@ pub trait ScopeVisitor {
     /// items whose name collides with an earlier one in [`Scope::sources`].
     ///
     /// It fires once the item is complete: after the item's `skipped` events
-    /// and after its child scope, if any, has been entered and exited.
+    /// and after its child scope, if any, has been entered and exited. A
+    /// parenthesized join is the exception: it is itself an item, reported
+    /// with `registered_as: None` before the items inside it.
     ///
     /// `index` is the item's position in the scope's pre-order sequence of
-    /// FROM items, and `depth` is 0 for top-level items. A parenthesized join
-    /// is itself an item; items registered inside it follow it at `depth + 1`.
-    /// Currently a parenthesized join is reported as one item with
-    /// `registered_as: None` and its contents are reported through `skipped`,
-    /// so `depth` is always 0.
+    /// FROM items, and `depth` is 0 for top-level items. Items inside a
+    /// parenthesized join follow it at `depth + 1`.
     ///
     /// `registered_as` is the key the item was inserted under in
     /// [`Scope::sources`], or `None` when the item yields no source. `child`
@@ -754,17 +753,17 @@ pub trait ScopeVisitor {
 
     /// Called for each subtree of a FROM item that gets no scope and is not
     /// searched for subqueries, such as table-function and `UNNEST`
-    /// arguments, `VALUES` row values, `LATERAL` calls, `PIVOT` clauses and
-    /// table sample or time-travel arguments. An item the builder does not
-    /// handle at all, such as the contents of a parenthesized join, is
-    /// reported whole.
+    /// arguments, `VALUES` row values, `LATERAL` calls, `PIVOT` and
+    /// `MATCH_RECOGNIZE` clauses and table sample or time-travel arguments.
+    /// An item the builder does not handle at all, such as an aliased
+    /// parenthesized join, is reported whole.
     ///
     /// The values of a `VALUES` body that becomes a scope (a derived table,
     /// CTE body, root or set-operation branch) are reported against that
-    /// scope. Hive-style `LATERAL VIEW` clauses after the FROM clause are not
-    /// FROM items, so their calls are reported after the scope's last
-    /// `reference`. A table, derived-table body or CTE body is never
-    /// reported as a whole, since each gets a scope.
+    /// scope. Hive-style `LATERAL VIEW` clauses are not FROM items, so their
+    /// calls are reported after the last `reference` of the FROM clause or
+    /// parenthesized join they follow. A table, derived-table body or CTE
+    /// body is never reported as a whole, since each gets a scope.
     fn skipped(&mut self, _scope: ScopeId, _expression: &Expression) {}
 
     /// Called when a scope is complete.
@@ -872,33 +871,14 @@ fn build_scope_impl(
                 process_ctes(with, current_scope, builder);
             }
 
-            // Register relations in order. CTE declarations are available for
-            // FROM lookup, but only selected preceding bindings are lateral inputs.
-            let mut preceding_sources = HashSet::new();
-            for (index, table) in select
+            let mut from_items = FromItems::default();
+            for item in select
                 .from
                 .iter()
                 .flat_map(|from| &from.expressions)
                 .chain(select.joins.iter().map(|join| &join.this))
-                .enumerate()
             {
-                let first_child = current_scope.derived_table_scopes.len();
-                let name = add_table_to_scope(table, current_scope, &preceding_sources, builder);
-                let child = current_scope
-                    .derived_table_scopes
-                    .get(first_child)
-                    .and_then(Scope::id);
-                builder.visitor.reference(
-                    built_id(current_scope),
-                    index,
-                    0,
-                    table,
-                    name.as_deref(),
-                    child,
-                );
-                if let Some(name) = name {
-                    preceding_sources.insert(name);
-                }
+                from_items.add(item, 0, current_scope, builder);
             }
 
             // Process table-generating lateral views (Hive/Spark style UDTFs).
@@ -1017,6 +997,68 @@ fn cte_body_self_references(cte: &crate::expressions::Cte) -> bool {
             _ => false,
         })
         .is_empty()
+}
+
+/// Registers the FROM/JOIN items of one scope in source order.
+///
+/// CTE declarations are available for FROM lookup, but only the bindings of
+/// preceding items are lateral inputs.
+#[derive(Default)]
+struct FromItems {
+    next_index: usize,
+    preceding_sources: HashSet<String>,
+}
+
+impl FromItems {
+    /// Registers `item` and reports it to the visitor. The items inside a
+    /// parenthesized join are registered as if the join were not
+    /// parenthesized, after the join itself is reported.
+    fn add(
+        &mut self,
+        item: &Expression,
+        depth: usize,
+        scope: &mut Scope,
+        builder: &mut ScopeBuilder,
+    ) {
+        let index = self.next_index;
+        self.next_index += 1;
+
+        let mut unwrapped = item;
+        while let Expression::Paren(paren) = unwrapped {
+            unwrapped = &paren.this;
+        }
+        if let Expression::JoinedTable(joined) = unwrapped {
+            // An alias hides the inner tables behind one name, which is not modelled.
+            if joined.alias.is_none() {
+                builder
+                    .visitor
+                    .reference(built_id(scope), index, depth, item, None, None);
+                for inner in
+                    std::iter::once(&joined.left).chain(joined.joins.iter().map(|join| &join.this))
+                {
+                    self.add(inner, depth + 1, scope, builder);
+                }
+                for lateral_view in &joined.lateral_views {
+                    add_lateral_view_to_scope(lateral_view, scope, builder);
+                }
+                collect_subqueries(unwrapped, scope, builder);
+                return;
+            }
+        }
+
+        let first_child = scope.derived_table_scopes.len();
+        let name = add_table_to_scope(item, scope, &self.preceding_sources, builder);
+        let child = scope
+            .derived_table_scopes
+            .get(first_child)
+            .and_then(Scope::id);
+        builder
+            .visitor
+            .reference(built_id(scope), index, depth, item, name.as_deref(), child);
+        if let Some(name) = name {
+            self.preceding_sources.insert(name);
+        }
+    }
 }
 
 fn add_table_to_scope(
@@ -1140,30 +1182,33 @@ fn add_table_to_scope(
         Expression::LateralView(lateral_view) => {
             add_lateral_view_to_scope(lateral_view, scope, builder)
         }
-        Expression::Pivot(pivot) => {
-            let name =
-                pivot_source_name(&pivot.this, pivot.alias.as_ref().map(|a| a.name.as_str()));
-            scope.add_source_info(
-                name.clone(),
-                SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
-            );
-            add_pivot_inner_scope(&pivot.this, scope, builder);
-            builder.skip_children(scope, expr, &["this"]);
-            Some(name)
-        }
-        Expression::Unpivot(unpivot) => {
-            let name = pivot_source_name(
-                &unpivot.this,
-                unpivot.alias.as_ref().map(|a| a.name.as_str()),
-            );
-            scope.add_source_info(
-                name.clone(),
-                SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
-            );
-            add_pivot_inner_scope(&unpivot.this, scope, builder);
-            builder.skip_children(scope, expr, &["this"]);
-            Some(name)
-        }
+        Expression::Pivot(pivot) => Some(add_pivot_to_scope(
+            expr,
+            &pivot.this,
+            pivot.alias.as_ref(),
+            scope,
+            builder,
+        )),
+        Expression::Unpivot(unpivot) => Some(add_pivot_to_scope(
+            expr,
+            &unpivot.this,
+            unpivot.alias.as_ref(),
+            scope,
+            builder,
+        )),
+        Expression::MatchRecognize(match_recognize) => match match_recognize.this.as_deref() {
+            Some(source) => Some(add_pivot_to_scope(
+                expr,
+                source,
+                match_recognize.alias.as_ref(),
+                scope,
+                builder,
+            )),
+            None => {
+                builder.skipped(scope, expr);
+                None
+            }
+        },
         Expression::Paren(paren) => {
             add_table_to_scope(&paren.this, scope, preceding_sources, builder)
         }
@@ -1212,6 +1257,27 @@ fn pivot_source_name(source: &Expression, explicit_alias: Option<&str>) -> Strin
     }
 }
 
+/// Registers a `PIVOT`, `UNPIVOT` or `MATCH_RECOGNIZE` item, whose output
+/// columns differ from its input's, as one derived source named after its alias,
+/// or else after its input. A derived-table input gets its own scope; a table
+/// input is not registered separately.
+fn add_pivot_to_scope(
+    expr: &Expression,
+    source: &Expression,
+    alias: Option<&crate::expressions::Identifier>,
+    scope: &mut Scope,
+    builder: &mut ScopeBuilder,
+) -> String {
+    let name = pivot_source_name(source, alias.map(|alias| alias.name.as_str()));
+    scope.add_source_info(
+        name.clone(),
+        SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
+    );
+    add_pivot_inner_scope(source, scope, builder);
+    builder.skip_children(scope, expr, &["this"]);
+    name
+}
+
 fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope, builder: &mut ScopeBuilder) {
     match source {
         Expression::Subquery(subquery) => {
@@ -1221,7 +1287,8 @@ fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope, builder: &mut S
             scope.derived_table_scopes.push(derived_scope);
         }
         Expression::Paren(paren) => add_pivot_inner_scope(&paren.this, scope, builder),
-        _ => {}
+        Expression::Table(_) => builder.skip_children(scope, source, &[]),
+        _ => builder.skipped(scope, source),
     }
 }
 
@@ -1247,7 +1314,7 @@ fn add_lateral_view_to_scope(
 }
 
 fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope, builder: &mut ScopeBuilder) {
-    if matches!(expr, Expression::Select(_)) {
+    if matches!(expr, Expression::Select(_) | Expression::JoinedTable(_)) {
         use crate::ast_children::ChildPathSegment::{Field, Index};
 
         // Include JOIN predicates, ORDER BY and QUALIFY as well as projections
@@ -1256,7 +1323,7 @@ fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope, builder: &mut
         crate::ast_children::for_each_child(expr, |path, child| {
             if !matches!(
                 path,
-                [Field("from" | "with" | "lateral_views"), ..]
+                [Field("from" | "left" | "with" | "lateral_views"), ..]
                     | [Field("joins"), Index(_), Field("this"), ..]
             ) {
                 collect_subqueries_in_expr(child, parent_scope, builder);
@@ -1716,6 +1783,76 @@ mod tests {
         );
         assert_eq!(scope.subquery_scopes.len(), 1);
         assert!(scope.subquery_scopes[0].sources.contains_key("u"));
+    }
+
+    #[test]
+    fn test_parenthesized_join_sources() {
+        fn names(sources: &HashMap<String, SourceInfo>) -> Vec<&str> {
+            let mut names: Vec<_> = sources.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            names
+        }
+
+        let scope = parse_and_build_scope(
+            "SELECT a.x FROM (a JOIN b ON a.id = b.id) JOIN c ON c.id = a.id",
+        );
+        assert_eq!(names(&scope.sources), ["a", "b", "c"]);
+
+        let scope = parse_and_build_scope("SELECT * FROM ((a JOIN b ON TRUE) JOIN c ON TRUE)");
+        assert_eq!(names(&scope.sources), ["a", "b", "c"]);
+
+        let scope =
+            parse_and_build_scope("SELECT * FROM (a JOIN (SELECT id FROM t) AS d ON a.id = d.id)");
+        assert_eq!(names(&scope.sources), ["a", "d"]);
+        assert_eq!(scope.derived_table_scopes.len(), 1);
+        assert!(scope.derived_table_scopes[0].sources.contains_key("t"));
+
+        let scope = parse_and_build_scope(
+            "SELECT * FROM (a JOIN b ON a.id IN (SELECT id FROM u)) JOIN c ON TRUE",
+        );
+        assert_eq!(scope.subquery_scopes.len(), 1);
+        assert!(scope.subquery_scopes[0].sources.contains_key("u"));
+
+        let scope = parse_and_build_scope(
+            "SELECT * FROM t, (u JOIN LATERAL (SELECT t.a, u.b) AS l ON TRUE)",
+        );
+        assert_eq!(names(&scope.sources), ["l", "t", "u"]);
+        let lateral = &scope.derived_table_scopes[0];
+        assert!(lateral.is_lateral);
+        assert_eq!(names(&lateral.lateral_sources), ["t", "u"]);
+    }
+
+    #[test]
+    fn test_parenthesized_asof_join_match_condition_subquery() {
+        let sql = "SELECT * FROM (a ASOF JOIN b MATCH_CONDITION(a.t >= (SELECT MAX(t) FROM u)))";
+        let ast = crate::parse(sql, crate::DialectType::Snowflake).expect("Failed to parse SQL");
+        let scope = build_scope(&ast[0]);
+        assert_eq!(scope.subquery_scopes.len(), 1);
+        assert!(scope.subquery_scopes[0].sources.contains_key("u"));
+    }
+
+    #[test]
+    fn test_match_recognize_sources() {
+        let build = |sql: &str| {
+            let ast =
+                crate::parse(sql, crate::DialectType::Snowflake).expect("Failed to parse SQL");
+            build_scope(&ast[0])
+        };
+        let clause = "MATCH_RECOGNIZE (PATTERN (A B) DEFINE A AS A.price > 10)";
+
+        let scope = build(&format!("SELECT * FROM ticker {clause} AS mr"));
+        assert_eq!(scope.sources.keys().collect::<Vec<_>>(), ["mr"]);
+        assert_eq!(scope.sources["mr"].kind, SourceKind::DerivedTable);
+
+        let scope = build(&format!("SELECT * FROM ticker {clause}"));
+        assert_eq!(scope.sources.keys().collect::<Vec<_>>(), ["ticker"]);
+
+        let scope = build(&format!(
+            "SELECT * FROM (SELECT * FROM ticker) {clause} AS s"
+        ));
+        assert_eq!(scope.sources.keys().collect::<Vec<_>>(), ["s"]);
+        assert_eq!(scope.derived_table_scopes.len(), 1);
+        assert!(scope.derived_table_scopes[0].sources.contains_key("ticker"));
     }
 
     #[test]
@@ -2185,19 +2322,42 @@ mod tests {
             .collect();
         assert_eq!(names, [Some(""), Some("")]);
 
-        let (_, recorder) = record("SELECT * FROM (a JOIN b ON TRUE) JOIN c ON TRUE", Generic);
-        let items: Vec<_> = recorder
-            .references
-            .iter()
-            .map(|reference| {
-                (
-                    reference.index,
-                    reference.depth,
-                    reference.registered_as.as_deref(),
-                )
-            })
-            .collect();
-        assert_eq!(items, [(0, 0, None), (1, 0, Some("c"))]);
+        for (sql, expected) in [
+            (
+                "SELECT * FROM (a JOIN b ON TRUE) JOIN c ON TRUE",
+                &[
+                    (0, 0, None),
+                    (1, 1, Some("a")),
+                    (2, 1, Some("b")),
+                    (3, 0, Some("c")),
+                ][..],
+            ),
+            (
+                "SELECT * FROM ((a JOIN b ON TRUE) JOIN c ON TRUE) JOIN d ON TRUE",
+                &[
+                    (0, 0, None),
+                    (1, 1, None),
+                    (2, 2, Some("a")),
+                    (3, 2, Some("b")),
+                    (4, 1, Some("c")),
+                    (5, 0, Some("d")),
+                ],
+            ),
+        ] {
+            let (_, recorder) = record(sql, Generic);
+            let items: Vec<_> = recorder
+                .references
+                .iter()
+                .map(|reference| {
+                    (
+                        reference.index,
+                        reference.depth,
+                        reference.registered_as.as_deref(),
+                    )
+                })
+                .collect();
+            assert_eq!(items, expected, "{sql}");
+        }
     }
 
     #[test]
@@ -2258,8 +2418,28 @@ mod tests {
                 true,
             ),
             (
+                Snowflake,
+                "SELECT * FROM t AT(TIMESTAMP => (SELECT MAX(ts) FROM u)) \
+                 MATCH_RECOGNIZE (PATTERN (A) DEFINE A AS TRUE)",
+                3,
+                true,
+            ),
+            (
+                Snowflake,
+                "SELECT * FROM t MATCH_RECOGNIZE \
+                 (PATTERN (A) DEFINE A AS A.x > (SELECT MAX(x) FROM u))",
+                1,
+                true,
+            ),
+            (
                 Generic,
                 "SELECT * FROM (a JOIN b ON TRUE) JOIN c ON TRUE",
+                0,
+                false,
+            ),
+            (
+                Generic,
+                "SELECT * FROM (a JOIN b ON TRUE) AS j JOIN c ON TRUE",
                 1,
                 false,
             ),
@@ -2320,6 +2500,11 @@ mod tests {
                 DuckDB,
                 "SELECT * FROM (SELECT region, q, amt FROM sales) \
                  PIVOT(SUM(amt) FOR q IN ('Q1' AS q1))",
+            ),
+            (
+                Generic,
+                "SELECT * FROM (a JOIN (SELECT 1 AS id) d ON a.id IN (SELECT 2)) \
+                 JOIN c ON TRUE",
             ),
         ] {
             let (scope, mut recorder) = record(sql, dialect);
