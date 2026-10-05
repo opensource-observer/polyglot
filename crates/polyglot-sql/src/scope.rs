@@ -1060,9 +1060,16 @@ fn add_from_item(
     let index = *next_index;
     *next_index += 1;
 
-    let (name, child) = if parenthesized_join(item).is_some() {
-        let name =
-            add_joined_table_to_scope(item, depth, next_index, scope, preceding_sources, builder);
+    let (name, child) = if let Some(join) = parenthesized_join(item) {
+        let name = add_joined_table_to_scope(
+            item,
+            join,
+            depth,
+            next_index,
+            scope,
+            preceding_sources,
+            builder,
+        );
         (name, None)
     } else {
         let first_child = scope.derived_table_scopes.len();
@@ -1103,16 +1110,17 @@ fn parenthesized_join(item: &Expression) -> Option<(&JoinedTable, Option<&Identi
 /// Without an alias, the join's relations are registered in `scope` like
 /// top-level items. An alias hides them: they are still built and reported,
 /// but `scope` keeps only the alias, as a source with no scope of its own.
-/// Returns the alias, if any.
+/// `join` is what [`parenthesized_join`] returns for `item`. Returns the
+/// alias, if any.
 fn add_joined_table_to_scope(
     item: &Expression,
+    (joined, alias): (&JoinedTable, Option<&Identifier>),
     depth: usize,
     next_index: &mut usize,
     scope: &mut Scope,
     preceding_sources: &mut HashSet<String>,
     builder: &mut ScopeBuilder,
 ) -> Option<String> {
-    let (joined, alias) = parenthesized_join(item)?;
     // The relations inside an aliased join still see each other, and the
     // items before the join, as LATERAL inputs, so they are registered as
     // usual and the enclosing names restored afterwards.
@@ -1139,7 +1147,7 @@ fn add_joined_table_to_scope(
     };
     // A subquery in these conditions may refer to the hidden names, which a
     // child scope could not resolve, so the conditions are left unscoped.
-    skip_join_conditions(joined, scope, builder);
+    for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
     scope.sources = sources;
     *preceding_sources = preceding;
     scope.add_source_info(
@@ -1149,10 +1157,9 @@ fn add_joined_table_to_scope(
     Some(alias.name.clone())
 }
 
-/// Reports the conditions of the joins in `joined` as skipped, including
-/// those of unaliased joins nested in it. A nested aliased join reports its
-/// own.
-fn skip_join_conditions(joined: &JoinedTable, scope: &Scope, builder: &mut ScopeBuilder) {
+/// Calls `f` on each join condition in `joined`, including those of unaliased
+/// parenthesized joins nested in it. A nested aliased join handles its own.
+fn for_each_join_condition<'a>(joined: &'a JoinedTable, f: &mut impl FnMut(&'a Expression)) {
     use crate::ast_children::AstNode;
     use crate::ast_children::ChildPathSegment::{Field, Index};
 
@@ -1160,10 +1167,10 @@ fn skip_join_conditions(joined: &JoinedTable, scope: &Scope, builder: &mut Scope
         [Field("lateral_views"), ..] => {}
         [Field("left")] | [Field("joins"), Index(_), Field("this")] => {
             if let Some((nested, None)) = parenthesized_join(child) {
-                skip_join_conditions(nested, scope, builder);
+                for_each_join_condition(nested, f);
             }
         }
-        _ => builder.skipped(scope, child),
+        _ => f(child),
     });
 }
 
@@ -1418,20 +1425,12 @@ fn collect_nested_join_subqueries(
     parent_scope: &mut Scope,
     builder: &mut ScopeBuilder,
 ) {
-    use crate::ast_children::AstNode;
-    use crate::ast_children::ChildPathSegment::{Field, Index};
-
     // An aliased join's conditions are reported as skipped when it is built.
-    let Some((joined, None)) = parenthesized_join(item) else {
-        return;
-    };
-    joined.visit_expressions(&mut Vec::new(), &mut |path, child| match path {
-        [Field("lateral_views"), ..] => {}
-        [Field("left")] | [Field("joins"), Index(_), Field("this")] => {
-            collect_nested_join_subqueries(child, parent_scope, builder);
-        }
-        _ => collect_subqueries_in_expr(child, parent_scope, builder),
-    });
+    if let Some((joined, None)) = parenthesized_join(item) {
+        for_each_join_condition(joined, &mut |condition| {
+            collect_subqueries_in_expr(condition, parent_scope, builder)
+        });
+    }
 }
 
 fn collect_subqueries_in_expr(
@@ -2454,8 +2453,8 @@ mod tests {
             .collect()
     }
 
-    fn source_names(scope: &Scope) -> Vec<&str> {
-        let mut names: Vec<_> = scope.sources.keys().map(String::as_str).collect();
+    fn sorted_keys(sources: &HashMap<String, SourceInfo>) -> Vec<&str> {
+        let mut names: Vec<_> = sources.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
     }
@@ -2468,7 +2467,7 @@ mod tests {
             "SELECT * FROM (a JOIN b ON a.id = b.id) JOIN c ON TRUE",
             Generic,
         );
-        assert_eq!(source_names(&scope), ["a", "b", "c"]);
+        assert_eq!(sorted_keys(&scope.sources), ["a", "b", "c"]);
         assert_eq!(
             from_items(&recorder),
             [
@@ -2484,7 +2483,7 @@ mod tests {
             "SELECT * FROM ((a JOIN b ON TRUE) JOIN c ON TRUE), d",
             Generic,
         );
-        assert_eq!(source_names(&scope), ["a", "b", "c", "d"]);
+        assert_eq!(sorted_keys(&scope.sources), ["a", "b", "c", "d"]);
         assert_eq!(
             from_items(&recorder),
             [
@@ -2500,7 +2499,7 @@ mod tests {
         // A parenthesized join that starts with a derived table.
         let (scope, recorder) =
             record("SELECT * FROM ((SELECT 1 AS x) AS s CROSS JOIN b)", Generic);
-        assert_eq!(source_names(&scope), ["b", "s"]);
+        assert_eq!(sorted_keys(&scope.sources), ["b", "s"]);
         assert_eq!(scope.derived_table_scopes.len(), 1);
         assert_eq!(
             recorder.references[0].child,
@@ -2521,7 +2520,7 @@ mod tests {
         let inner_tables: Vec<_> = scope
             .subquery_scopes
             .iter()
-            .map(|subquery| source_names(subquery))
+            .map(|subquery| sorted_keys(&subquery.sources))
             .collect();
         assert_eq!(inner_tables, [["s"], ["t"]]);
         assert!(recorder.skipped.is_empty());
@@ -2547,27 +2546,21 @@ mod tests {
             "SELECT * FROM (a JOIN b ON TRUE) CROSS JOIN LATERAL (SELECT a.x, b.y) l",
             Generic,
         );
-        let mut lateral: Vec<_> = scope.derived_table_scopes[0]
-            .lateral_sources
-            .keys()
-            .map(String::as_str)
-            .collect();
-        lateral.sort_unstable();
-        assert_eq!(lateral, ["a", "b"]);
+        assert_eq!(
+            sorted_keys(&scope.derived_table_scopes[0].lateral_sources),
+            ["a", "b"]
+        );
 
         // Inside an aliased join, a LATERAL item sees the items before it.
         let (scope, _) = record(
             "SELECT * FROM x, (a CROSS JOIN LATERAL (SELECT a.v, x.w) l) AS j",
             Generic,
         );
-        let mut lateral: Vec<_> = scope.derived_table_scopes[0]
-            .lateral_sources
-            .keys()
-            .map(String::as_str)
-            .collect();
-        lateral.sort_unstable();
-        assert_eq!(lateral, ["a", "x"]);
-        assert_eq!(source_names(&scope), ["j", "x"]);
+        assert_eq!(
+            sorted_keys(&scope.derived_table_scopes[0].lateral_sources),
+            ["a", "x"]
+        );
+        assert_eq!(sorted_keys(&scope.sources), ["j", "x"]);
     }
 
     #[test]
@@ -2578,7 +2571,7 @@ mod tests {
             "SELECT * FROM (a CROSS JOIN b LATERAL VIEW explode(a.xs) e AS x)",
             Hive,
         );
-        assert_eq!(source_names(&scope), ["a", "b", "e"]);
+        assert_eq!(sorted_keys(&scope.sources), ["a", "b", "e"]);
         assert_eq!(scope.sources["e"].kind, SourceKind::Virtual);
     }
 
@@ -2593,7 +2586,7 @@ mod tests {
             "SELECT * FROM (a JOIN b ON TRUE) j(x, y)",
         ] {
             let (scope, recorder) = record(sql, PostgreSQL);
-            assert_eq!(source_names(&scope), ["j"], "{sql}");
+            assert_eq!(sorted_keys(&scope.sources), ["j"], "{sql}");
             let source = &scope.sources["j"];
             assert_eq!(
                 (source.kind, source.is_scope),
@@ -2612,7 +2605,7 @@ mod tests {
             "SELECT * FROM ((a JOIN b ON TRUE) JOIN c ON TRUE) AS j",
             Generic,
         );
-        assert_eq!(source_names(&scope), ["j"]);
+        assert_eq!(sorted_keys(&scope.sources), ["j"]);
         assert_eq!(
             from_items(&recorder),
             [
@@ -2629,7 +2622,7 @@ mod tests {
             "SELECT * FROM ((a JOIN b ON TRUE) AS j JOIN c ON j.id = c.id)",
             Generic,
         );
-        assert_eq!(source_names(&scope), ["c", "j"]);
+        assert_eq!(sorted_keys(&scope.sources), ["c", "j"]);
         assert_eq!(
             from_items(&recorder),
             [
@@ -2648,7 +2641,7 @@ mod tests {
             "SELECT * FROM ((SELECT 1 AS x) AS s CROSS JOIN b) AS j",
             Generic,
         );
-        assert_eq!(source_names(&scope), ["j"]);
+        assert_eq!(sorted_keys(&scope.sources), ["j"]);
         assert_eq!(scope.derived_table_scopes.len(), 1);
         assert_eq!(
             recorder.references[0].child,
@@ -2657,7 +2650,7 @@ mod tests {
 
         // The alias hides an inner name without disturbing an outer one.
         let (scope, recorder) = record("SELECT * FROM a, (a CROSS JOIN b) AS j, c", Generic);
-        assert_eq!(source_names(&scope), ["a", "c", "j"]);
+        assert_eq!(sorted_keys(&scope.sources), ["a", "c", "j"]);
         assert!(matches!(
             &scope.sources["a"].expression,
             Expression::Table(table) if table.alias.is_none()
@@ -2679,7 +2672,7 @@ mod tests {
         use crate::DialectType::Generic;
 
         let (scope, recorder) = record("SELECT * FROM (a CROSS JOIN x), y AS a", Generic);
-        assert_eq!(source_names(&scope), ["a", "x"]);
+        assert_eq!(sorted_keys(&scope.sources), ["a", "x"]);
         assert!(matches!(
             &scope.sources["a"].expression,
             Expression::Table(table) if table.name.name == "y"
