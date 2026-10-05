@@ -2102,7 +2102,7 @@ mod tests {
             crate::DialectType::Generic,
         );
         let [root, subquery] = &recorder.entered[..] else {
-            panic!("{:?}", recorder.entered);
+            panic!("expected a root scope and one subquery scope");
         };
         assert_eq!(scope.subquery_scopes[0].id(), Some(subquery.id));
         assert_eq!(subquery.parent, Some(root.id));
