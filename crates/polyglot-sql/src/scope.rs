@@ -1284,7 +1284,7 @@ fn collect_subqueries_in_expr(
             Expression::Exists(exists) => Some(&exists.this),
             Expression::In(in_expr) => in_expr.query.as_ref(),
             Expression::Any(quantified) | Expression::All(quantified) => {
-                Some(scope_query(&quantified.subquery))
+                Some(scope_query(&quantified.subquery)).filter(|query| is_bare_query(query))
             }
             _ => None,
         };
@@ -2069,6 +2069,17 @@ mod tests {
             parse_and_build_scope("SELECT ARRAY(SELECT x FROM u UNION ALL SELECT y FROM v) FROM t");
         assert_eq!(scope.subquery_scopes.len(), 1);
         assert_eq!(scope.subquery_scopes[0].union_scopes.len(), 2);
+
+        // An array operand of ANY/ALL is not a query, so only its inner query gets a scope.
+        for sql in [
+            "SELECT 1 FROM t WHERE x = ANY(ARRAY(SELECT y FROM u))",
+            "SELECT 1 FROM t WHERE x = ALL(ARRAY(SELECT y FROM u))",
+        ] {
+            let scope = parse_and_build_scope(sql);
+            assert_eq!(scope.subquery_scopes.len(), 1, "{sql}");
+            assert!(scope.subquery_scopes[0].is_subquery(), "{sql}");
+            assert!(scope.subquery_scopes[0].sources.contains_key("u"), "{sql}");
+        }
     }
 
     #[test]

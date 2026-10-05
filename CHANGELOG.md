@@ -19,7 +19,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 - `build_scope` now gives a subquery scope to a query that is a bare operand of
   an expression, such as the argument of `ARRAY(SELECT ...)`, instead of
   leaving its tables and columns out of the scope tree. This matches sqlglot,
-  which treats every unwrapped query in scope as a subquery.
+  which treats every unwrapped query in scope as a subquery. An `ANY`/`ALL`
+  array operand such as `ANY(ARRAY(SELECT ...))` no longer gets an empty scope
+  of its own, so that expression now yields one subquery scope instead of two.
 - `Scope::traverse` and `traverse_scope` now yield derived-table scopes in
   post-order. Previously they walked the never-populated `table_scopes`, so
   `traverse_scope("SELECT a FROM (SELECT b FROM t) x")` returned only the root
