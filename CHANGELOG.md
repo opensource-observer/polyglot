@@ -40,6 +40,11 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   SQL, and T-SQL `TOP` and ClickHouse `ORDER BY`/`LIMIT` now apply to the whole
   set operation. Parenthesized set operations used as values, such as
   `SELECT ((SELECT 1) UNION (SELECT 2))`, parse as before.
+- Scope building registers an `ANY`, `SOME` or `ALL` subquery once instead of
+  twice, and its subquery scope's expression is the inner query, as for other
+  subqueries. `x = ANY (SELECT k FROM u)` previously produced two
+  `subquery_scopes`. A subquery wrapped in extra parentheses, such as
+  `x = ((SELECT k FROM u))`, is likewise registered once.
 
 ## [0.13.1] - 2026-09-30
 

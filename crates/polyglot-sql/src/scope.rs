@@ -1273,10 +1273,14 @@ fn collect_subqueries_in_expr(
     let mut seen = HashSet::new();
     for node in walk_in_scope(expr, false) {
         let query = match node {
-            Expression::Subquery(subquery) if subquery.alias.is_none() => Some(&subquery.this),
+            Expression::Subquery(subquery) if subquery.alias.is_none() => {
+                Some(scope_query(&subquery.this))
+            }
             Expression::Exists(exists) => Some(&exists.this),
             Expression::In(in_expr) => in_expr.query.as_ref(),
-            Expression::Any(quantified) | Expression::All(quantified) => Some(&quantified.subquery),
+            Expression::Any(quantified) | Expression::All(quantified) => {
+                Some(scope_query(&quantified.subquery))
+            }
             _ => None,
         };
 
@@ -1952,6 +1956,27 @@ mod tests {
 
         assert_eq!(scope.subquery_scopes.len(), 1);
         assert_eq!(scope.subquery_scopes[0].union_scopes.len(), 2);
+    }
+
+    #[test]
+    fn test_quantified_subquery_is_one_subquery_scope() {
+        for sql in [
+            "SELECT x FROM t WHERE x = ANY (SELECT k FROM u)",
+            "SELECT x FROM t WHERE x > ALL (SELECT k FROM u)",
+            "SELECT x FROM t WHERE x <> SOME (SELECT k FROM u)",
+            "SELECT x FROM t WHERE x = SOME (SELECT k FROM u)",
+            "SELECT x FROM t WHERE x = ANY (((SELECT k FROM u)))",
+            "SELECT x FROM t WHERE x = ((SELECT k FROM u))",
+            "SELECT x FROM t WHERE x IN (SELECT k FROM u)",
+            "SELECT x FROM t WHERE EXISTS (SELECT k FROM u)",
+        ] {
+            let scope = parse_and_build_scope(sql);
+            assert_eq!(scope.subquery_scopes.len(), 1, "{sql}");
+            assert!(
+                matches!(scope.subquery_scopes[0].expression, Expression::Select(_)),
+                "{sql}"
+            );
+        }
     }
 
     #[test]
