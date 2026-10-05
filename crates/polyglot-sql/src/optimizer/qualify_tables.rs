@@ -11,7 +11,7 @@ use crate::helper::name_sequence;
 use crate::optimizer::normalize_identifiers::{
     get_normalization_strategy, normalize_identifier, NormalizationStrategy,
 };
-use crate::scope::traverse_scope;
+use crate::scope::build_scope;
 use std::collections::{HashMap, HashSet};
 
 /// Options for table qualification
@@ -134,11 +134,13 @@ pub fn qualify_tables(expression: Expression, options: &QualifyTablesOptions) ->
     } else {
         &options.alias_prefix
     };
-    let mut reserved_aliases: HashSet<String> = traverse_scope(&expression)
+    let root = build_scope(&expression);
+    let mut reserved_aliases: HashSet<String> = root
+        .traverse()
         .into_iter()
-        .flat_map(|scope| scope.sources.into_keys())
+        .flat_map(|scope| scope.sources.keys())
         .filter(|name| !name.is_empty())
-        .map(|name| normalize_identifier(Identifier::new(name), strategy).name)
+        .map(|name| normalize_identifier(Identifier::new(name.clone()), strategy).name)
         .collect();
     let mut alias_sequence = name_sequence(alias_prefix);
     let mut next_alias = || loop {
@@ -697,6 +699,16 @@ mod tests {
             sql,
             "SELECT * FROM (SELECT * FROM (SELECT 1 AS a) AS _0) AS _1, (SELECT 2 AS b) AS _2"
         );
+    }
+
+    #[test]
+    fn test_deeply_nested_derived_tables() {
+        let depth = 200;
+        let sql = (0..depth).fold("SELECT * FROM t".to_string(), |inner, _| {
+            format!("SELECT * FROM ({inner})")
+        });
+        let out = gen(&qualify_tables(parse(&sql), &QualifyTablesOptions::new()));
+        assert_eq!(out.matches(" AS _").count(), depth);
     }
 
     #[test]
