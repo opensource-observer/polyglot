@@ -199,6 +199,8 @@ pub struct Scope {
 
     /// Cached external columns
     external_columns_cache: Option<Vec<ColumnRef>>,
+
+    id: Option<ScopeId>,
 }
 
 impl Scope {
@@ -221,6 +223,7 @@ impl Scope {
             union_scopes: Vec::new(),
             columns_cache: None,
             external_columns_cache: None,
+            id: None,
         }
     }
 
@@ -259,7 +262,15 @@ impl Scope {
             union_scopes: Vec::new(),
             columns_cache: None,
             external_columns_cache: None,
+            id: None,
         }
+    }
+
+    /// The id assigned by the build that created this scope, or `None` for a
+    /// scope created directly with [`Scope::new`], [`Scope::branch`] or
+    /// [`Scope::branch_with_options`].
+    pub fn id(&self) -> Option<ScopeId> {
+        self.id
     }
 
     /// Clear all cached properties
@@ -651,100 +662,303 @@ fn collect_columns(expr: &Expression, columns: &mut Vec<ColumnRef>) {
     }
 }
 
+/// Identifies a scope created by one [`build_scope_with`] call.
+///
+/// Ids are unique within that call and assigned in creation order, starting
+/// with the root scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScopeId(u32);
+
+/// Observes scope construction in [`build_scope_with`].
+///
+/// Every method has an empty default implementation. A visitor sees the
+/// expressions being scoped but never the [`Scope`] tree itself, so it cannot
+/// change what is built. Ids reported here match [`Scope::id`] on the finished
+/// tree.
+///
+/// `enter_scope` and `exit_scope` nest like a stack: a child scope is entered
+/// and exited while its parent is open, and every `reference` and `skipped`
+/// event belongs to the innermost open scope.
+///
+/// # Example
+///
+/// Collect the FROM/JOIN item names of a query in source order:
+///
+/// ```
+/// use polyglot_sql::{build_scope_with, parse, DialectType, Expression, ScopeId, ScopeVisitor};
+///
+/// #[derive(Default)]
+/// struct FromItemNames(Vec<Option<String>>);
+///
+/// impl ScopeVisitor for FromItemNames {
+///     fn reference(
+///         &mut self,
+///         _scope: ScopeId,
+///         _index: usize,
+///         _depth: usize,
+///         _item: &Expression,
+///         registered_as: Option<&str>,
+///         _child: Option<ScopeId>,
+///     ) {
+///         self.0.push(registered_as.map(str::to_string));
+///     }
+/// }
+///
+/// let sql = "SELECT * FROM a JOIN (SELECT 1) AS b ON TRUE JOIN a AS c ON TRUE";
+/// let ast = parse(sql, DialectType::Generic).unwrap();
+/// let mut names = FromItemNames::default();
+/// build_scope_with(&ast[0], &mut names);
+/// assert_eq!(
+///     names.0,
+///     [Some("a".to_string()), Some("b".to_string()), Some("c".to_string())]
+/// );
+/// ```
+pub trait ScopeVisitor {
+    /// Called when a scope is created, before its contents are processed.
+    /// `parent` is the enclosing scope, or `None` for the root.
+    fn enter_scope(
+        &mut self,
+        _id: ScopeId,
+        _parent: Option<ScopeId>,
+        _scope_type: ScopeType,
+        _expression: &Expression,
+    ) {
+    }
+
+    /// Called once per FROM/JOIN item of `scope`, in source order, including
+    /// items whose name collides with an earlier one in [`Scope::sources`].
+    ///
+    /// It fires once the item is complete: after the item's `skipped` events
+    /// and after its child scope, if any, has been entered and exited.
+    ///
+    /// `index` is the item's position in the scope's pre-order sequence of
+    /// FROM items, and `depth` is 0 for top-level items. A parenthesized join
+    /// is itself an item; items registered inside it follow it at `depth + 1`.
+    /// Currently a parenthesized join is reported as one item with
+    /// `registered_as: None` and its contents are reported through `skipped`,
+    /// so `depth` is always 0.
+    ///
+    /// `registered_as` is the key the item was inserted under in
+    /// [`Scope::sources`], or `None` when the item yields no source. `child`
+    /// is the scope built for the item, if any.
+    fn reference(
+        &mut self,
+        _scope: ScopeId,
+        _index: usize,
+        _depth: usize,
+        _item: &Expression,
+        _registered_as: Option<&str>,
+        _child: Option<ScopeId>,
+    ) {
+    }
+
+    /// Called for each subtree of a FROM item that gets no scope and is not
+    /// searched for subqueries, such as table-function and `UNNEST`
+    /// arguments, `VALUES` row values, `LATERAL` calls, `PIVOT` clauses and
+    /// table sample or time-travel arguments. An item the builder does not
+    /// handle at all, such as the contents of a parenthesized join, is
+    /// reported whole.
+    ///
+    /// The values of a `VALUES` body that becomes a scope (a derived table,
+    /// CTE body, root or set-operation branch) are reported against that
+    /// scope. Hive-style `LATERAL VIEW` clauses after the FROM clause are not
+    /// FROM items, so their calls are reported after the scope's last
+    /// `reference`. A table, derived-table body or CTE body is never
+    /// reported as a whole, since each gets a scope.
+    fn skipped(&mut self, _scope: ScopeId, _expression: &Expression) {}
+
+    /// Called when a scope is complete.
+    fn exit_scope(&mut self, _id: ScopeId) {}
+}
+
+/// A [`ScopeVisitor`] that ignores every event.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopScopeVisitor;
+
+impl ScopeVisitor for NoopScopeVisitor {}
+
 /// Build scope tree from an expression
 ///
 /// This traverses the expression tree and builds a hierarchy of Scope objects
 /// that track sources and column references at each level.
 pub fn build_scope(expression: &Expression) -> Scope {
-    build_scope_with_ctes(expression, &HashMap::new())
+    build_scope_with(expression, &mut NoopScopeVisitor)
+}
+
+/// Build a scope tree like [`build_scope`], reporting its construction to
+/// `visitor`.
+pub fn build_scope_with(expression: &Expression, visitor: &mut dyn ScopeVisitor) -> Scope {
+    build_scope_with_ctes(expression, &HashMap::new(), visitor)
 }
 
 /// Build a query scope with CTE definitions inherited from its lexical parent.
 pub(crate) fn build_scope_with_ctes(
     expression: &Expression,
     ctes: &HashMap<String, SourceInfo>,
+    visitor: &mut dyn ScopeVisitor,
 ) -> Scope {
-    let mut root = Scope::new(expression.clone());
+    let mut builder = ScopeBuilder {
+        visitor,
+        next_id: 0,
+    };
+    let mut root = builder.register(Scope::new(expression.clone()), None);
     root.cte_sources = ctes.clone();
-    build_scope_impl(expression, &mut root);
+    build_scope_impl(expression, &mut root, &mut builder);
+    builder.visitor.exit_scope(built_id(&root));
     root
 }
 
-fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
+struct ScopeBuilder<'v> {
+    visitor: &'v mut dyn ScopeVisitor,
+    next_id: u32,
+}
+
+impl ScopeBuilder<'_> {
+    /// Assigns the next id to a newly created scope and reports it.
+    fn register(&mut self, mut scope: Scope, parent: Option<ScopeId>) -> Scope {
+        let id = ScopeId(self.next_id);
+        self.next_id += 1;
+        scope.id = Some(id);
+        self.visitor
+            .enter_scope(id, parent, scope.scope_type, &scope.expression);
+        scope
+    }
+
+    fn branch(&mut self, parent: &Scope, expression: Expression, scope_type: ScopeType) -> Scope {
+        self.register(parent.branch(expression, scope_type), parent.id)
+    }
+
+    /// Builds `body` into `child` and reports `child` as complete.
+    fn build_child(&mut self, mut child: Scope, body: &Expression) -> Scope {
+        build_scope_impl(body, &mut child, self);
+        self.visitor.exit_scope(built_id(&child));
+        child
+    }
+
+    fn skipped(&mut self, scope: &Scope, expression: &Expression) {
+        self.visitor.skipped(built_id(scope), expression);
+    }
+
+    /// Reports the direct children of `item` as skipped, except those under
+    /// the `scoped` fields.
+    fn skip_children(&mut self, scope: &Scope, item: &Expression, scoped: &[&str]) {
+        use crate::ast_children::ChildPathSegment::Field;
+
+        let id = built_id(scope);
+        crate::ast_children::for_each_child(item, |path, child| {
+            if !matches!(path.first(), Some(Field(field)) if scoped.contains(field)) {
+                self.visitor.skipped(id, child);
+            }
+        });
+    }
+}
+
+fn built_id(scope: &Scope) -> ScopeId {
+    scope.id.expect("scopes created by a build have an id")
+}
+
+fn build_scope_impl(
+    expression: &Expression,
+    current_scope: &mut Scope,
+    builder: &mut ScopeBuilder,
+) {
     match expression {
         Expression::Prepare(prepare) => {
-            build_scope_impl(&prepare.statement, current_scope);
+            build_scope_impl(&prepare.statement, current_scope, builder);
         }
         Expression::Select(select) => {
             // Process CTEs first
             if let Some(with) = &select.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, builder);
             }
 
             // Register relations in order. CTE declarations are available for
             // FROM lookup, but only selected preceding bindings are lateral inputs.
             let mut preceding_sources = HashSet::new();
-            for table in select
+            for (index, table) in select
                 .from
                 .iter()
                 .flat_map(|from| &from.expressions)
                 .chain(select.joins.iter().map(|join| &join.this))
+                .enumerate()
             {
-                if let Some(name) = add_table_to_scope(table, current_scope, &preceding_sources) {
+                let first_child = current_scope.derived_table_scopes.len();
+                let name = add_table_to_scope(table, current_scope, &preceding_sources, builder);
+                let child = current_scope
+                    .derived_table_scopes
+                    .get(first_child)
+                    .and_then(Scope::id);
+                builder.visitor.reference(
+                    built_id(current_scope),
+                    index,
+                    0,
+                    table,
+                    name.as_deref(),
+                    child,
+                );
+                if let Some(name) = name {
                     preceding_sources.insert(name);
                 }
             }
 
             // Process table-generating lateral views (Hive/Spark style UDTFs).
             for lateral_view in &select.lateral_views {
-                add_lateral_view_to_scope(lateral_view, current_scope);
+                add_lateral_view_to_scope(lateral_view, current_scope, builder);
             }
 
             // Process subqueries in WHERE, SELECT expressions, etc.
-            collect_subqueries(expression, current_scope);
+            collect_subqueries(expression, current_scope, builder);
         }
         Expression::Union(union) => {
             if let Some(with) = &union.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, builder);
             }
 
-            let mut left_scope = current_scope.branch(union.left.clone(), ScopeType::SetOperation);
-            build_scope_impl(&union.left, &mut left_scope);
+            let left_scope =
+                builder.branch(current_scope, union.left.clone(), ScopeType::SetOperation);
+            let left_scope = builder.build_child(left_scope, &union.left);
 
-            let mut right_scope =
-                current_scope.branch(union.right.clone(), ScopeType::SetOperation);
-            build_scope_impl(&union.right, &mut right_scope);
+            let right_scope =
+                builder.branch(current_scope, union.right.clone(), ScopeType::SetOperation);
+            let right_scope = builder.build_child(right_scope, &union.right);
 
             current_scope.union_scopes.push(left_scope);
             current_scope.union_scopes.push(right_scope);
         }
         Expression::Intersect(intersect) => {
             if let Some(with) = &intersect.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, builder);
             }
 
-            let mut left_scope =
-                current_scope.branch(intersect.left.clone(), ScopeType::SetOperation);
-            build_scope_impl(&intersect.left, &mut left_scope);
+            let left_scope = builder.branch(
+                current_scope,
+                intersect.left.clone(),
+                ScopeType::SetOperation,
+            );
+            let left_scope = builder.build_child(left_scope, &intersect.left);
 
-            let mut right_scope =
-                current_scope.branch(intersect.right.clone(), ScopeType::SetOperation);
-            build_scope_impl(&intersect.right, &mut right_scope);
+            let right_scope = builder.branch(
+                current_scope,
+                intersect.right.clone(),
+                ScopeType::SetOperation,
+            );
+            let right_scope = builder.build_child(right_scope, &intersect.right);
 
             current_scope.union_scopes.push(left_scope);
             current_scope.union_scopes.push(right_scope);
         }
         Expression::Except(except) => {
             if let Some(with) = &except.with {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, builder);
             }
 
-            let mut left_scope = current_scope.branch(except.left.clone(), ScopeType::SetOperation);
-            build_scope_impl(&except.left, &mut left_scope);
+            let left_scope =
+                builder.branch(current_scope, except.left.clone(), ScopeType::SetOperation);
+            let left_scope = builder.build_child(left_scope, &except.left);
 
-            let mut right_scope =
-                current_scope.branch(except.right.clone(), ScopeType::SetOperation);
-            build_scope_impl(&except.right, &mut right_scope);
+            let right_scope =
+                builder.branch(current_scope, except.right.clone(), ScopeType::SetOperation);
+            let right_scope = builder.build_child(right_scope, &except.right);
 
             current_scope.union_scopes.push(left_scope);
             current_scope.union_scopes.push(right_scope);
@@ -753,34 +967,41 @@ fn build_scope_impl(expression: &Expression, current_scope: &mut Scope) {
             // Handle CREATE TABLE ... AS [WITH ...] SELECT ...
             // Process CTEs if present
             if let Some(with) = &create.with_cte {
-                process_ctes(with, current_scope);
+                process_ctes(with, current_scope, builder);
             }
             // Traverse the AS SELECT body
             if let Some(as_select) = &create.as_select {
-                build_scope_impl(as_select, current_scope);
+                build_scope_impl(as_select, current_scope, builder);
             }
         }
         Expression::Subquery(subquery) => {
-            build_scope_impl(&subquery.this, current_scope);
+            build_scope_impl(&subquery.this, current_scope, builder);
         }
         Expression::Paren(paren) => {
-            build_scope_impl(&paren.this, current_scope);
+            build_scope_impl(&paren.this, current_scope, builder);
+        }
+        Expression::Values(_) => {
+            builder.skip_children(current_scope, expression, &[]);
         }
         _ => {}
     }
 }
 
-fn process_ctes(with: &crate::expressions::With, current_scope: &mut Scope) {
+fn process_ctes(
+    with: &crate::expressions::With,
+    current_scope: &mut Scope,
+    builder: &mut ScopeBuilder,
+) {
     for cte in &with.ctes {
         let cte_name = cte.alias.name.clone();
         let cte_expr = Expression::Cte(Box::new(cte.clone()));
-        let mut cte_scope = current_scope.branch(cte_expr.clone(), ScopeType::Cte);
+        let mut cte_scope = builder.branch(current_scope, cte_expr.clone(), ScopeType::Cte);
 
         if with.recursive && cte_body_self_references(cte) {
             cte_scope.add_cte_source(cte_name.clone(), cte_expr.clone());
         }
 
-        build_scope_impl(&cte.this, &mut cte_scope);
+        let cte_scope = builder.build_child(cte_scope, &cte.this);
         current_scope.add_cte_source(cte_name, cte_expr);
         current_scope.cte_scopes.push(cte_scope);
     }
@@ -802,6 +1023,7 @@ fn add_table_to_scope(
     expr: &Expression,
     scope: &mut Scope,
     preceding_sources: &HashSet<String>,
+    builder: &mut ScopeBuilder,
 ) -> Option<String> {
     match expr {
         Expression::Table(table) => {
@@ -831,6 +1053,7 @@ fn add_table_to_scope(
                 }
                 scope.add_source_info(name.clone(), source);
             }
+            builder.skip_children(scope, expr, &[]);
             Some(name)
         }
         Expression::Subquery(subquery) => {
@@ -840,7 +1063,8 @@ fn add_table_to_scope(
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
 
-            let mut derived_scope = scope.branch(subquery.this.clone(), ScopeType::DerivedTable);
+            let mut derived_scope =
+                builder.branch(scope, subquery.this.clone(), ScopeType::DerivedTable);
             if subquery.lateral {
                 derived_scope.is_lateral = true;
                 derived_scope.can_be_correlated = true;
@@ -854,19 +1078,21 @@ fn add_table_to_scope(
                     })
                     .collect();
             }
-            build_scope_impl(&subquery.this, &mut derived_scope);
+            let derived_scope = builder.build_child(derived_scope, &subquery.this);
 
             scope.add_source(name.clone(), expr.clone(), true);
             scope.derived_table_scopes.push(derived_scope);
             Some(name)
         }
         Expression::Unnest(unnest) => {
+            builder.skip_children(scope, expr, &[]);
             if let Some(alias) = &unnest.alias {
                 scope.add_virtual_source(alias.name.clone(), expr.clone());
             }
             unnest.alias.as_ref().map(|alias| alias.name.clone())
         }
         Expression::Values(values) => {
+            builder.skip_children(scope, expr, &[]);
             let name = values
                 .alias
                 .as_ref()
@@ -875,42 +1101,44 @@ fn add_table_to_scope(
             scope.add_virtual_source(name.clone(), expr.clone());
             Some(name)
         }
-        Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
-            scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
-            Some(alias.alias.name.clone())
-        }
         Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
             let outer_columns = alias
                 .column_aliases
                 .iter()
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>();
-            let mut derived_scope = scope.branch_with_options(
-                alias.this.clone(),
-                ScopeType::DerivedTable,
-                None,
-                None,
-                Some(outer_columns),
-            );
-            build_scope_impl(&alias.this, &mut derived_scope);
+            let mut derived_scope =
+                builder.branch(scope, alias.this.clone(), ScopeType::DerivedTable);
+            derived_scope.outer_columns = outer_columns;
+            let derived_scope = builder.build_child(derived_scope, &alias.this);
 
             scope.add_source(alias.alias.name.clone(), expr.clone(), true);
             scope.derived_table_scopes.push(derived_scope);
             Some(alias.alias.name.clone())
         }
+        Expression::Alias(alias) => match &alias.this {
+            Expression::Unnest(_) => {
+                builder.skip_children(scope, &alias.this, &[]);
+                scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
+                Some(alias.alias.name.clone())
+            }
+            Expression::Function(_) => {
+                add_table_to_scope(&alias.this, scope, preceding_sources, builder)
+            }
+            _ => {
+                builder.skipped(scope, expr);
+                None
+            }
+        },
         Expression::Lateral(lateral) => {
+            builder.skip_children(scope, expr, &[]);
             if let Some(alias) = &lateral.alias {
                 scope.add_virtual_source(alias.clone(), expr.clone());
             }
             lateral.alias.clone()
         }
         Expression::LateralView(lateral_view) => {
-            add_lateral_view_to_scope(lateral_view, scope);
-            lateral_view
-                .table_alias
-                .as_ref()
-                .or_else(|| lateral_view.column_aliases.first())
-                .map(|alias| alias.name.clone())
+            add_lateral_view_to_scope(lateral_view, scope, builder)
         }
         Expression::Pivot(pivot) => {
             let name =
@@ -919,7 +1147,8 @@ fn add_table_to_scope(
                 name.clone(),
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&pivot.this, scope);
+            add_pivot_inner_scope(&pivot.this, scope, builder);
+            builder.skip_children(scope, expr, &["this"]);
             Some(name)
         }
         Expression::Unpivot(unpivot) => {
@@ -931,11 +1160,21 @@ fn add_table_to_scope(
                 name.clone(),
                 SourceInfo::new(expr.clone(), false, SourceKind::DerivedTable),
             );
-            add_pivot_inner_scope(&unpivot.this, scope);
+            add_pivot_inner_scope(&unpivot.this, scope, builder);
+            builder.skip_children(scope, expr, &["this"]);
             Some(name)
         }
-        Expression::Paren(paren) => add_table_to_scope(&paren.this, scope, preceding_sources),
-        _ => None,
+        Expression::Paren(paren) => {
+            add_table_to_scope(&paren.this, scope, preceding_sources, builder)
+        }
+        Expression::Function(_) => {
+            builder.skip_children(scope, expr, &[]);
+            None
+        }
+        other => {
+            builder.skipped(scope, other);
+            None
+        }
     }
 }
 
@@ -973,34 +1212,41 @@ fn pivot_source_name(source: &Expression, explicit_alias: Option<&str>) -> Strin
     }
 }
 
-fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope) {
+fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope, builder: &mut ScopeBuilder) {
     match source {
         Expression::Subquery(subquery) => {
-            let mut derived_scope = scope.branch(subquery.this.clone(), ScopeType::DerivedTable);
-            build_scope_impl(&subquery.this, &mut derived_scope);
+            let derived_scope =
+                builder.branch(scope, subquery.this.clone(), ScopeType::DerivedTable);
+            let derived_scope = builder.build_child(derived_scope, &subquery.this);
             scope.derived_table_scopes.push(derived_scope);
         }
-        Expression::Paren(paren) => add_pivot_inner_scope(&paren.this, scope),
+        Expression::Paren(paren) => add_pivot_inner_scope(&paren.this, scope, builder),
         _ => {}
     }
 }
 
-fn add_lateral_view_to_scope(lateral_view: &crate::expressions::LateralView, scope: &mut Scope) {
+fn add_lateral_view_to_scope(
+    lateral_view: &crate::expressions::LateralView,
+    scope: &mut Scope,
+    builder: &mut ScopeBuilder,
+) -> Option<String> {
+    builder.skipped(scope, &lateral_view.this);
     let alias = lateral_view
         .table_alias
         .as_ref()
         .or_else(|| lateral_view.column_aliases.first())
         .map(|alias| alias.name.clone());
 
-    if let Some(alias) = alias {
+    if let Some(alias) = &alias {
         scope.add_virtual_source(
-            alias,
+            alias.clone(),
             Expression::LateralView(Box::new(lateral_view.clone())),
         );
     }
+    alias
 }
 
-fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
+fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope, builder: &mut ScopeBuilder) {
     if matches!(expr, Expression::Select(_)) {
         use crate::ast_children::ChildPathSegment::{Field, Index};
 
@@ -1013,13 +1259,17 @@ fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope) {
                 [Field("from" | "with" | "lateral_views"), ..]
                     | [Field("joins"), Index(_), Field("this"), ..]
             ) {
-                collect_subqueries_in_expr(child, parent_scope);
+                collect_subqueries_in_expr(child, parent_scope, builder);
             }
         });
     }
 }
 
-fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
+fn collect_subqueries_in_expr(
+    expr: &Expression,
+    parent_scope: &mut Scope,
+    builder: &mut ScopeBuilder,
+) {
     let mut seen = HashSet::new();
     for node in walk_in_scope(expr, false) {
         let query = match node {
@@ -1039,8 +1289,8 @@ fn collect_subqueries_in_expr(expr: &Expression, parent_scope: &mut Scope) {
             continue;
         }
 
-        let mut sub_scope = parent_scope.branch(query.clone(), ScopeType::Subquery);
-        build_scope_impl(query, &mut sub_scope);
+        let sub_scope = builder.branch(parent_scope, query.clone(), ScopeType::Subquery);
+        let sub_scope = builder.build_child(sub_scope, query);
         parent_scope.subquery_scopes.push(sub_scope);
     }
 }
@@ -1813,6 +2063,282 @@ mod tests {
             "CTAS target table should not be treated as a source"
         );
         assert_eq!(scope.cte_scopes.len(), 1);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Reference {
+        scope: ScopeId,
+        index: usize,
+        depth: usize,
+        registered_as: Option<String>,
+        child: Option<ScopeId>,
+    }
+
+    #[derive(Debug)]
+    struct Entered {
+        id: ScopeId,
+        parent: Option<ScopeId>,
+        scope_type: ScopeType,
+    }
+
+    /// Records visitor events, asserting that they nest like a stack.
+    #[derive(Default)]
+    struct Recorder {
+        open: Vec<ScopeId>,
+        entered: Vec<Entered>,
+        references: Vec<Reference>,
+        skipped: Vec<Expression>,
+    }
+
+    impl Recorder {
+        fn assert_innermost(&self, scope: ScopeId) {
+            assert_eq!(self.open.last(), Some(&scope));
+        }
+    }
+
+    impl ScopeVisitor for Recorder {
+        fn enter_scope(
+            &mut self,
+            id: ScopeId,
+            parent: Option<ScopeId>,
+            scope_type: ScopeType,
+            _expression: &Expression,
+        ) {
+            assert_eq!(parent, self.open.last().copied());
+            self.open.push(id);
+            self.entered.push(Entered {
+                id,
+                parent,
+                scope_type,
+            });
+        }
+
+        fn reference(
+            &mut self,
+            scope: ScopeId,
+            index: usize,
+            depth: usize,
+            _item: &Expression,
+            registered_as: Option<&str>,
+            child: Option<ScopeId>,
+        ) {
+            self.assert_innermost(scope);
+            self.references.push(Reference {
+                scope,
+                index,
+                depth,
+                registered_as: registered_as.map(String::from),
+                child,
+            });
+        }
+
+        fn skipped(&mut self, scope: ScopeId, expression: &Expression) {
+            self.assert_innermost(scope);
+            self.skipped.push(expression.clone());
+        }
+
+        fn exit_scope(&mut self, id: ScopeId) {
+            assert_eq!(self.open.pop(), Some(id));
+        }
+    }
+
+    fn record(sql: &str, dialect: crate::DialectType) -> (Scope, Recorder) {
+        let ast = crate::parse(sql, dialect).expect("Failed to parse SQL");
+        let mut recorder = Recorder::default();
+        let scope = build_scope_with(&ast[0], &mut recorder);
+        assert!(recorder.open.is_empty(), "{sql}");
+        (scope, recorder)
+    }
+
+    #[test]
+    fn test_visitor_reports_references() {
+        use crate::DialectType::Generic;
+
+        let (scope, recorder) = record(
+            "SELECT * FROM a JOIN (SELECT 1) x ON TRUE JOIN LATERAL (SELECT a.c) l ON TRUE",
+            Generic,
+        );
+        let root = scope.id().unwrap();
+        let reference = |index, name: &str, child: Option<&Scope>| Reference {
+            scope: root,
+            index,
+            depth: 0,
+            registered_as: Some(name.to_string()),
+            child: child.map(|child| child.id().unwrap()),
+        };
+        assert_eq!(
+            recorder.references,
+            [
+                reference(0, "a", None),
+                reference(1, "x", Some(&scope.derived_table_scopes[0])),
+                reference(2, "l", Some(&scope.derived_table_scopes[1])),
+            ]
+        );
+
+        let (scope, recorder) = record("SELECT * FROM (SELECT 1), (SELECT 2)", Generic);
+        assert_eq!(scope.sources.len(), 1);
+        let names: Vec<_> = recorder
+            .references
+            .iter()
+            .filter(|reference| Some(reference.scope) == scope.id())
+            .map(|reference| reference.registered_as.as_deref())
+            .collect();
+        assert_eq!(names, [Some(""), Some("")]);
+
+        let (_, recorder) = record("SELECT * FROM (a JOIN b ON TRUE) JOIN c ON TRUE", Generic);
+        let items: Vec<_> = recorder
+            .references
+            .iter()
+            .map(|reference| {
+                (
+                    reference.index,
+                    reference.depth,
+                    reference.registered_as.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(items, [(0, 0, None), (1, 0, Some("c"))]);
+    }
+
+    #[test]
+    fn test_visitor_reports_skipped() {
+        use crate::DialectType::{Generic, Hive, Snowflake};
+
+        // (dialect, sql, skipped subtrees, whether one of them holds a query)
+        for (dialect, sql, count, holds_query) in [
+            (Generic, "SELECT * FROM UNNEST(arr)", 1, false),
+            (
+                Generic,
+                "SELECT * FROM UNNEST((SELECT [1])) AS x(v)",
+                1,
+                true,
+            ),
+            (Generic, "SELECT * FROM f((SELECT 1))", 1, true),
+            (Generic, "SELECT * FROM f((SELECT 1)) AS g", 1, true),
+            (
+                Generic,
+                "SELECT * FROM (VALUES ((SELECT 1))) AS v(x)",
+                1,
+                true,
+            ),
+            (
+                Snowflake,
+                "SELECT * FROM VALUES (1), ((SELECT 2)) AS v(x)",
+                2,
+                true,
+            ),
+            (
+                Snowflake,
+                "SELECT * FROM t, LATERAL FLATTEN(input => (SELECT a FROM u))",
+                1,
+                true,
+            ),
+            (
+                Hive,
+                "SELECT * FROM t LATERAL VIEW explode((SELECT a FROM u)) e AS x",
+                1,
+                true,
+            ),
+            (
+                Snowflake,
+                "SELECT * FROM t AT(TIMESTAMP => (SELECT MAX(ts) FROM u))",
+                2,
+                true,
+            ),
+            (
+                Generic,
+                "SELECT * FROM t TABLESAMPLE BERNOULLI (10)",
+                1,
+                false,
+            ),
+            (
+                Snowflake,
+                "SELECT * FROM t PIVOT(SUM(a) FOR b IN (SELECT b FROM u))",
+                2,
+                true,
+            ),
+            (
+                Generic,
+                "SELECT * FROM (a JOIN b ON TRUE) JOIN c ON TRUE",
+                1,
+                false,
+            ),
+            (Generic, "SELECT * FROM t, (SELECT 1) d", 0, false),
+        ] {
+            let (_, recorder) = record(sql, dialect);
+            assert_eq!(
+                recorder.skipped.len(),
+                count,
+                "{sql}: {:?}",
+                recorder.skipped
+            );
+            let has_query = recorder.skipped.iter().any(|expression| {
+                !expression
+                    .find_all(|node| matches!(node, Expression::Select(_)))
+                    .is_empty()
+            });
+            assert_eq!(has_query, holds_query, "{sql}");
+        }
+    }
+
+    fn child_scopes(scope: &Scope) -> impl Iterator<Item = &Scope> {
+        scope
+            .cte_scopes
+            .iter()
+            .chain(&scope.union_scopes)
+            .chain(&scope.derived_table_scopes)
+            .chain(&scope.udtf_scopes)
+            .chain(&scope.subquery_scopes)
+    }
+
+    /// Checks every scope of the tree against its `enter_scope` event, removing
+    /// the events it matches.
+    fn assert_mirrors(scope: &Scope, parent: Option<ScopeId>, entered: &mut Vec<Entered>) {
+        let id = scope.id().expect("built scopes have an id");
+        let position = entered
+            .iter()
+            .position(|event| event.id == id)
+            .expect("every built scope is entered");
+        let event = entered.remove(position);
+        assert_eq!((event.parent, event.scope_type), (parent, scope.scope_type));
+        for child in child_scopes(scope) {
+            assert_mirrors(child, Some(id), entered);
+        }
+    }
+
+    #[test]
+    fn test_visitor_mirrors_tree() {
+        use crate::DialectType::{DuckDB, Generic};
+
+        for (dialect, sql) in [
+            (
+                Generic,
+                "WITH c AS (SELECT 1) SELECT * FROM c, (SELECT 2 UNION SELECT 3) d, \
+                 LATERAL (SELECT c.x) l WHERE c.x IN (SELECT 1) ORDER BY (SELECT 2)",
+            ),
+            (
+                DuckDB,
+                "SELECT * FROM (SELECT region, q, amt FROM sales) \
+                 PIVOT(SUM(amt) FOR q IN ('Q1' AS q1))",
+            ),
+        ] {
+            let (scope, mut recorder) = record(sql, dialect);
+            let ids: Vec<_> = recorder.entered.iter().map(|event| event.id).collect();
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{sql}");
+            assert_eq!(ids.first().copied(), scope.id(), "{sql}");
+            assert_mirrors(&scope, None, &mut recorder.entered);
+            assert!(recorder.entered.is_empty(), "{sql}");
+        }
+
+        let (scope, recorder) = record(
+            "SELECT * FROM (SELECT region, q, amt FROM sales) \
+             PIVOT(SUM(amt) FOR q IN ('Q1' AS q1))",
+            DuckDB,
+        );
+        assert_eq!(
+            recorder.references.last().unwrap().child,
+            scope.derived_table_scopes[0].id()
+        );
     }
 
     #[test]
