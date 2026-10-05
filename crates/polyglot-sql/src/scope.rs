@@ -2515,7 +2515,7 @@ mod tests {
             ) {
                 if scope_type == ScopeType::Cte {
                     let Expression::Cte(cte) = expression else {
-                        panic!("expected an Expression::Cte, got {expression:?}");
+                        panic!("expected an Expression::Cte");
                     };
                     self.0.push(cte.alias.name.clone());
                 }
