@@ -40,6 +40,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   SQL, and T-SQL `TOP` and ClickHouse `ORDER BY`/`LIMIT` now apply to the whole
   set operation. Parenthesized set operations used as values, such as
   `SELECT ((SELECT 1) UNION (SELECT 2))`, parse as before.
+- `Scope::outer_columns` is now filled for derived tables parsed as
+  `(SELECT ...) AS q(a, b)` and for CTEs declared as `WITH c(a, b) AS (...)`.
+  Previously it was set only for a parenthesized derived table, so most
+  renamed scopes reported an empty list.
 
 ## [0.13.1] - 2026-09-30
 
