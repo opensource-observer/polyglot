@@ -107,6 +107,37 @@ fn lateral_source_visibility_472() {
 }
 
 #[test]
+fn parenthesized_join_sources() {
+    let schema = review_schema();
+    let options = SchemaValidationOptions {
+        check_references: true,
+        ..Default::default()
+    };
+    for sql in [
+        "SELECT i.active FROM (items i JOIN other o ON i.quantity = o.active)",
+        "SELECT i.active, o.quantity FROM ((items i CROSS JOIN other o)) WHERE i.quantity > 0",
+        "SELECT x.n FROM (items i JOIN other o ON i.quantity = o.active) \
+         CROSS JOIN LATERAL (SELECT i.quantity AS n) x",
+        "SELECT i.quantity FROM (items i JOIN other o \
+         ON i.quantity IN (SELECT quantity FROM items WHERE active = o.quantity))",
+    ] {
+        let result = validate_with_schema(sql, DialectType::PostgreSQL, &schema, &options);
+        assert!(result.valid, "{sql}: {:?}", result.errors);
+    }
+    for (sql, code) in [
+        ("SELECT i.missing FROM (items i CROSS JOIN other o)", "E201"),
+        ("SELECT quantity FROM (items i CROSS JOIN other o)", "E221"),
+    ] {
+        let result = validate_with_schema(sql, DialectType::PostgreSQL, &schema, &options);
+        assert!(
+            !result.valid && result.errors.iter().any(|error| error.code == code),
+            "{sql}: {:?}",
+            result.errors
+        );
+    }
+}
+
+#[test]
 fn insert_source_query_validation_474() {
     let schema = review_schema();
     for check_types in [false, true] {

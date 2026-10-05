@@ -771,9 +771,10 @@ pub trait ScopeVisitor {
     /// An unaliased parenthesized join yields no source of its own: the items
     /// inside it are registered in `scope` like top-level items. An aliased
     /// one, `(a JOIN b) AS j`, is registered as `j`, and its alias hides the
-    /// items inside it: they are still reported, with `registered_as` set to
-    /// the name each binds inside the join, but those names are not in
-    /// [`Scope::sources`].
+    /// items inside it: they are still built and reported, with
+    /// `registered_as` set to the name each binds inside the join, but they
+    /// add no entry to [`Scope::sources`], so for them `registered_as` is not
+    /// a key into it.
     fn reference(
         &mut self,
         _scope: ScopeId,
@@ -788,8 +789,9 @@ pub trait ScopeVisitor {
     /// Called for each subtree of a FROM item that gets no scope and is not
     /// searched for subqueries, such as table-function and `UNNEST`
     /// arguments, `VALUES` row values, `LATERAL` calls, `PIVOT` clauses and
-    /// table sample or time-travel arguments. An item the builder does not
-    /// handle at all is reported whole.
+    /// table sample or time-travel arguments, and the join conditions inside
+    /// an aliased parenthesized join. An item the builder does not handle at
+    /// all is reported whole.
     ///
     /// The values of a `VALUES` body that becomes a scope (a derived table,
     /// CTE body, root or set-operation branch) are reported against that
@@ -1058,29 +1060,18 @@ fn add_from_item(
     let index = *next_index;
     *next_index += 1;
 
-    let (name, child) = match parenthesized_join(item) {
-        Some((joined, alias)) => {
-            let name = add_joined_table_to_scope(
-                item,
-                joined,
-                alias,
-                depth,
-                next_index,
-                scope,
-                preceding_sources,
-                builder,
-            );
-            (name, None)
-        }
-        None => {
-            let first_child = scope.derived_table_scopes.len();
-            let name = add_table_to_scope(item, scope, preceding_sources, builder);
-            let child = scope
-                .derived_table_scopes
-                .get(first_child)
-                .and_then(Scope::id);
-            (name, child)
-        }
+    let (name, child) = if parenthesized_join(item).is_some() {
+        let name =
+            add_joined_table_to_scope(item, depth, next_index, scope, preceding_sources, builder);
+        (name, None)
+    } else {
+        let first_child = scope.derived_table_scopes.len();
+        let name = add_table_to_scope(item, scope, preceding_sources, builder);
+        let child = scope
+            .derived_table_scopes
+            .get(first_child)
+            .and_then(Scope::id);
+        (name, child)
     };
 
     builder
@@ -1106,23 +1097,22 @@ fn parenthesized_join(item: &Expression) -> Option<(&JoinedTable, Option<&Identi
     }
 }
 
-/// Registers the relations inside a parenthesized join, one depth below it.
+/// Registers the relations inside a parenthesized join item, one depth below
+/// it.
 ///
 /// Without an alias, the join's relations are registered in `scope` like
 /// top-level items. An alias hides them: they are still built and reported,
 /// but `scope` keeps only the alias, as a source with no scope of its own.
 /// Returns the alias, if any.
-#[allow(clippy::too_many_arguments)]
 fn add_joined_table_to_scope(
     item: &Expression,
-    joined: &JoinedTable,
-    alias: Option<&Identifier>,
     depth: usize,
     next_index: &mut usize,
     scope: &mut Scope,
     preceding_sources: &mut HashSet<String>,
     builder: &mut ScopeBuilder,
 ) -> Option<String> {
+    let (joined, alias) = parenthesized_join(item)?;
     // The relations inside an aliased join still see each other, and the
     // items before the join, as LATERAL inputs, so they are registered as
     // usual and the enclosing names restored afterwards.
@@ -1144,7 +1134,12 @@ fn add_joined_table_to_scope(
         }
     }
 
-    let ((sources, preceding), alias) = enclosing.zip(alias)?;
+    let (Some(alias), Some((sources, preceding))) = (alias, enclosing) else {
+        return None;
+    };
+    // A subquery in these conditions may refer to the hidden names, which a
+    // child scope could not resolve, so the conditions are left unscoped.
+    skip_join_conditions(joined, scope, builder);
     scope.sources = sources;
     *preceding_sources = preceding;
     scope.add_source_info(
@@ -1152,6 +1147,24 @@ fn add_joined_table_to_scope(
         SourceInfo::new(item.clone(), false, SourceKind::DerivedTable),
     );
     Some(alias.name.clone())
+}
+
+/// Reports the conditions of the joins in `joined` as skipped, including
+/// those of unaliased joins nested in it. A nested aliased join reports its
+/// own.
+fn skip_join_conditions(joined: &JoinedTable, scope: &Scope, builder: &mut ScopeBuilder) {
+    use crate::ast_children::AstNode;
+    use crate::ast_children::ChildPathSegment::{Field, Index};
+
+    joined.visit_expressions(&mut Vec::new(), &mut |path, child| match path {
+        [Field("lateral_views"), ..] => {}
+        [Field("left")] | [Field("joins"), Index(_), Field("this")] => {
+            if let Some((nested, None)) = parenthesized_join(child) {
+                skip_join_conditions(nested, scope, builder);
+            }
+        }
+        _ => builder.skipped(scope, child),
+    });
 }
 
 fn add_table_to_scope(
@@ -1398,7 +1411,7 @@ fn collect_subqueries(expr: &Expression, parent_scope: &mut Scope, builder: &mut
     }
 }
 
-/// Collects the subqueries in the conditions of the joins inside a
+/// Collects the subqueries in the conditions of the joins inside an unaliased
 /// parenthesized join FROM item, as for the conditions of top-level joins.
 fn collect_nested_join_subqueries(
     item: &Expression,
@@ -1408,7 +1421,8 @@ fn collect_nested_join_subqueries(
     use crate::ast_children::AstNode;
     use crate::ast_children::ChildPathSegment::{Field, Index};
 
-    let Some((joined, _)) = parenthesized_join(item) else {
+    // An aliased join's conditions are reported as skipped when it is built.
+    let Some((joined, None)) = parenthesized_join(item) else {
         return;
     };
     joined.visit_expressions(&mut Vec::new(), &mut |path, child| match path {
@@ -2512,11 +2526,17 @@ mod tests {
         assert_eq!(inner_tables, [["s"], ["t"]]);
         assert!(recorder.skipped.is_empty());
 
-        let (scope, _) = record(
-            "SELECT * FROM ((a JOIN b ON EXISTS (SELECT 1 FROM s)) JOIN c ON TRUE) AS j",
+        // An aliased join's conditions may use the names it hides, so they
+        // are reported as skipped rather than scoped.
+        let (scope, recorder) = record(
+            "SELECT * FROM ((a JOIN b ON EXISTS (SELECT 1 FROM s WHERE s.k = a.k)) \
+             JOIN c ON b.id = c.id) AS j",
             Generic,
         );
-        assert_eq!(scope.subquery_scopes.len(), 1);
+        assert!(scope.subquery_scopes.is_empty());
+        assert_eq!(recorder.skipped.len(), 2);
+        assert!(matches!(recorder.skipped[0], Expression::Exists(_)));
+        assert!(matches!(recorder.skipped[1], Expression::Eq(_)));
     }
 
     #[test]
@@ -2551,6 +2571,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parenthesized_join_lateral_view_is_a_source() {
+        use crate::DialectType::Hive;
+
+        let (scope, _) = record(
+            "SELECT * FROM (a CROSS JOIN b LATERAL VIEW explode(a.xs) e AS x)",
+            Hive,
+        );
+        assert_eq!(source_names(&scope), ["a", "b", "e"]);
+        assert_eq!(scope.sources["e"].kind, SourceKind::Virtual);
+    }
+
+    #[test]
     fn test_aliased_parenthesized_join_hides_its_relations() {
         use crate::DialectType::{Generic, PostgreSQL};
 
@@ -2574,6 +2606,54 @@ mod tests {
                 "{sql}"
             );
         }
+
+        // An alias on a parenthesized join that is itself parenthesized.
+        let (scope, recorder) = record(
+            "SELECT * FROM ((a JOIN b ON TRUE) JOIN c ON TRUE) AS j",
+            Generic,
+        );
+        assert_eq!(source_names(&scope), ["j"]);
+        assert_eq!(
+            from_items(&recorder),
+            [
+                (2, 2, Some("a")),
+                (3, 2, Some("b")),
+                (1, 1, None),
+                (4, 1, Some("c")),
+                (0, 0, Some("j")),
+            ]
+        );
+
+        // An aliased join inside an unaliased one hides only its own items.
+        let (scope, recorder) = record(
+            "SELECT * FROM ((a JOIN b ON TRUE) AS j JOIN c ON j.id = c.id)",
+            Generic,
+        );
+        assert_eq!(source_names(&scope), ["c", "j"]);
+        assert_eq!(
+            from_items(&recorder),
+            [
+                (2, 2, Some("a")),
+                (3, 2, Some("b")),
+                (1, 1, Some("j")),
+                (4, 1, Some("c")),
+                (0, 0, None),
+            ]
+        );
+        // Only the aliased join's own condition is hidden.
+        assert_eq!(recorder.skipped.len(), 1);
+
+        // A hidden derived table still gets its scope.
+        let (scope, recorder) = record(
+            "SELECT * FROM ((SELECT 1 AS x) AS s CROSS JOIN b) AS j",
+            Generic,
+        );
+        assert_eq!(source_names(&scope), ["j"]);
+        assert_eq!(scope.derived_table_scopes.len(), 1);
+        assert_eq!(
+            recorder.references[0].child,
+            scope.derived_table_scopes[0].id()
+        );
 
         // The alias hides an inner name without disturbing an outer one.
         let (scope, recorder) = record("SELECT * FROM a, (a CROSS JOIN b) AS j, c", Generic);
@@ -2687,12 +2767,7 @@ mod tests {
             (Generic, "SELECT * FROM t, (SELECT 1) d", 0, false),
         ] {
             let (_, recorder) = record(sql, dialect);
-            assert_eq!(
-                recorder.skipped.len(),
-                count,
-                "{sql}: {:?}",
-                recorder.skipped
-            );
+            assert_eq!(recorder.skipped.len(), count, "{sql}");
             let has_query = recorder.skipped.iter().any(|expression| {
                 !expression
                     .find_all(|node| matches!(node, Expression::Select(_)))
@@ -2741,6 +2816,11 @@ mod tests {
                 DuckDB,
                 "SELECT * FROM (SELECT region, q, amt FROM sales) \
                  PIVOT(SUM(amt) FOR q IN ('Q1' AS q1))",
+            ),
+            (
+                Generic,
+                "SELECT * FROM ((SELECT 1 AS x) AS s JOIN b ON b.x IN (SELECT 2)) \
+                 JOIN ((SELECT 3 AS y) AS t CROSS JOIN c) AS j ON TRUE",
             ),
         ] {
             let (scope, mut recorder) = record(sql, dialect);
@@ -2817,6 +2897,32 @@ mod tests {
         let entered = entered_nodes(&ast[0], ScopeType::DerivedTable);
         assert_eq!(entered.len(), 1);
         assert!(std::ptr::eq(entered[0], scope_query(derived)));
+
+        let ast = crate::parse(
+            "SELECT * FROM ((SELECT 1) AS d JOIN b ON b.x IN (SELECT 2))",
+            Default::default(),
+        )
+        .expect("Failed to parse SQL");
+        let Expression::Select(select) = &ast[0] else {
+            panic!("expected a SELECT");
+        };
+        let Some((joined, None)) =
+            parenthesized_join(&select.from.as_ref().unwrap().expressions[0])
+        else {
+            panic!("expected a parenthesized join");
+        };
+        let derived = entered_nodes(&ast[0], ScopeType::DerivedTable);
+        assert_eq!(derived.len(), 1);
+        assert!(std::ptr::eq(derived[0], scope_query(&joined.left)));
+        let Some(Expression::In(in_expr)) = &joined.joins[0].on else {
+            panic!("expected an IN condition");
+        };
+        let subqueries = entered_nodes(&ast[0], ScopeType::Subquery);
+        assert_eq!(subqueries.len(), 1);
+        assert!(std::ptr::eq(
+            subqueries[0],
+            scope_query(in_expr.query.as_ref().unwrap())
+        ));
 
         let ast = crate::parse("WITH c AS (SELECT 1) SELECT * FROM c", Default::default())
             .expect("Failed to parse SQL");

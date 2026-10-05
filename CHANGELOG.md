@@ -30,10 +30,13 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   parenthesized join registers each relation in the enclosing scope, nested
   joins included, and a later `LATERAL` item sees them. An aliased one,
   `(a JOIN b) AS j`, registers only `j`, since the alias hides the names
-  inside it. Subqueries in the conditions of the inner joins now get subquery
-  scopes. `ScopeVisitor::reference` reports the items inside a parenthesized
-  join at `depth + 1`, before the join itself, instead of reporting the join's
-  contents through `skipped`.
+  inside it. Subqueries in the conditions of an unaliased join's inner joins
+  now get subquery scopes; an aliased join's conditions may use the names it
+  hides, so they are still reported through `ScopeVisitor::skipped`.
+  `ScopeVisitor::reference` reports the items inside a parenthesized join at
+  `depth + 1`, before the join itself, instead of reporting the join's
+  contents through `skipped`. Schema validation now accepts valid queries over
+  an unaliased parenthesized join instead of reporting its tables as unknown.
 - `build_scope` now gives a subquery scope to a query in an expression field
   the scope walk skipped: an aggregate's `FILTER (WHERE ...)`, `ORDER BY` and
   `LIMIT`, a window frame bound, a `CAST` `FORMAT` or `DEFAULT` expression,
