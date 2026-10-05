@@ -56,7 +56,21 @@ impl Default for SourceKind {
 }
 
 /// Unwrap query containers without creating a new lexical context.
-pub(crate) fn scope_query(expression: &Expression) -> &Expression {
+///
+/// Peels `Cte`, `Subquery`, `Paren`, `Alias`, `Prepare` and
+/// `CREATE TABLE ... AS SELECT` wrappers, which is how the scope builder finds
+/// the query a scope is built from. Any other expression is returned as is.
+///
+/// ```
+/// use polyglot_sql::{parse, scope_query, DialectType, Expression};
+///
+/// let ast = parse("SELECT 1 FROM (SELECT 2) AS d", DialectType::Generic).unwrap();
+/// let Expression::Select(select) = &ast[0] else { unreachable!() };
+/// let derived = &select.from.as_ref().unwrap().expressions[0];
+/// assert!(matches!(derived, Expression::Subquery(_)));
+/// assert!(matches!(scope_query(derived), Expression::Select(_)));
+/// ```
+pub fn scope_query(expression: &Expression) -> &Expression {
     match expression {
         Expression::Cte(cte) => scope_query(&cte.this),
         Expression::Subquery(subquery) => scope_query(&subquery.this),
@@ -676,6 +690,18 @@ pub struct ScopeId(u32);
 /// change what is built. Ids reported here match [`Scope::id`] on the finished
 /// tree.
 ///
+/// The expressions passed to `enter_scope`, `reference` and `skipped` are nodes
+/// of the expression given to [`build_scope_with`], not copies, so a caller may
+/// key on their address for as long as it keeps that expression alive. For a
+/// derived table or subquery scope, `enter_scope` receives the query inside the
+/// wrapper.
+///
+/// A CTE scope is the one exception. The input holds a CTE as a `Cte` struct in
+/// `With::ctes`, not as an `Expression` node, so `enter_scope` receives an
+/// owned `Expression::Cte` (equal to [`Scope::expression`]) whose address is
+/// not in the input. The CTE's body is an input node: it is `Cte::this` of the
+/// matching entry in the input's `With`.
+///
 /// `enter_scope` and `exit_scope` nest like a stack: a child scope is entered
 /// and exited while its parent is open, and every `reference` and `skipped`
 /// event belongs to the innermost open scope.
@@ -801,7 +827,7 @@ pub(crate) fn build_scope_with_ctes(
         visitor,
         next_id: 0,
     };
-    let mut root = builder.register(Scope::new(expression.clone()), None);
+    let mut root = builder.register(Scope::new(expression.clone()), None, expression);
     root.cte_sources = ctes.clone();
     build_scope_impl(expression, &mut root, &mut builder);
     builder.visitor.exit_scope(built_id(&root));
@@ -814,18 +840,23 @@ struct ScopeBuilder<'v> {
 }
 
 impl ScopeBuilder<'_> {
-    /// Assigns the next id to a newly created scope and reports it.
-    fn register(&mut self, mut scope: Scope, parent: Option<ScopeId>) -> Scope {
+    /// Assigns the next id to a newly created scope and reports it, along with
+    /// the `input` node it was built from.
+    fn register(&mut self, mut scope: Scope, parent: Option<ScopeId>, input: &Expression) -> Scope {
         let id = ScopeId(self.next_id);
         self.next_id += 1;
         scope.id = Some(id);
         self.visitor
-            .enter_scope(id, parent, scope.scope_type, &scope.expression);
+            .enter_scope(id, parent, scope.scope_type, input);
         scope
     }
 
-    fn branch(&mut self, parent: &Scope, expression: Expression, scope_type: ScopeType) -> Scope {
-        self.register(parent.branch(expression, scope_type), parent.id)
+    fn branch(&mut self, parent: &Scope, expression: &Expression, scope_type: ScopeType) -> Scope {
+        self.register(
+            parent.branch(expression.clone(), scope_type),
+            parent.id,
+            expression,
+        )
     }
 
     /// Builds `body` into `child` and reports `child` as complete.
@@ -914,12 +945,10 @@ fn build_scope_impl(
                 process_ctes(with, current_scope, builder);
             }
 
-            let left_scope =
-                builder.branch(current_scope, union.left.clone(), ScopeType::SetOperation);
+            let left_scope = builder.branch(current_scope, &union.left, ScopeType::SetOperation);
             let left_scope = builder.build_child(left_scope, &union.left);
 
-            let right_scope =
-                builder.branch(current_scope, union.right.clone(), ScopeType::SetOperation);
+            let right_scope = builder.branch(current_scope, &union.right, ScopeType::SetOperation);
             let right_scope = builder.build_child(right_scope, &union.right);
 
             current_scope.union_scopes.push(left_scope);
@@ -930,18 +959,12 @@ fn build_scope_impl(
                 process_ctes(with, current_scope, builder);
             }
 
-            let left_scope = builder.branch(
-                current_scope,
-                intersect.left.clone(),
-                ScopeType::SetOperation,
-            );
+            let left_scope =
+                builder.branch(current_scope, &intersect.left, ScopeType::SetOperation);
             let left_scope = builder.build_child(left_scope, &intersect.left);
 
-            let right_scope = builder.branch(
-                current_scope,
-                intersect.right.clone(),
-                ScopeType::SetOperation,
-            );
+            let right_scope =
+                builder.branch(current_scope, &intersect.right, ScopeType::SetOperation);
             let right_scope = builder.build_child(right_scope, &intersect.right);
 
             current_scope.union_scopes.push(left_scope);
@@ -952,12 +975,10 @@ fn build_scope_impl(
                 process_ctes(with, current_scope, builder);
             }
 
-            let left_scope =
-                builder.branch(current_scope, except.left.clone(), ScopeType::SetOperation);
+            let left_scope = builder.branch(current_scope, &except.left, ScopeType::SetOperation);
             let left_scope = builder.build_child(left_scope, &except.left);
 
-            let right_scope =
-                builder.branch(current_scope, except.right.clone(), ScopeType::SetOperation);
+            let right_scope = builder.branch(current_scope, &except.right, ScopeType::SetOperation);
             let right_scope = builder.build_child(right_scope, &except.right);
 
             current_scope.union_scopes.push(left_scope);
@@ -995,7 +1016,11 @@ fn process_ctes(
     for cte in &with.ctes {
         let cte_name = cte.alias.name.clone();
         let cte_expr = Expression::Cte(Box::new(cte.clone()));
-        let mut cte_scope = builder.branch(current_scope, cte_expr.clone(), ScopeType::Cte);
+        let mut cte_scope = builder.register(
+            current_scope.branch(cte_expr.clone(), ScopeType::Cte),
+            current_scope.id,
+            &cte_expr,
+        );
         cte_scope.outer_columns = identifier_names(&cte.columns);
 
         if with.recursive && cte_body_self_references(cte) {
@@ -1064,8 +1089,7 @@ fn add_table_to_scope(
                 .map(|a| a.name.clone())
                 .unwrap_or_default();
 
-            let mut derived_scope =
-                builder.branch(scope, subquery.this.clone(), ScopeType::DerivedTable);
+            let mut derived_scope = builder.branch(scope, &subquery.this, ScopeType::DerivedTable);
             derived_scope.outer_columns = identifier_names(&subquery.column_aliases);
             if subquery.lateral {
                 derived_scope.is_lateral = true;
@@ -1104,8 +1128,7 @@ fn add_table_to_scope(
             Some(name)
         }
         Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
-            let mut derived_scope =
-                builder.branch(scope, alias.this.clone(), ScopeType::DerivedTable);
+            let mut derived_scope = builder.branch(scope, &alias.this, ScopeType::DerivedTable);
             derived_scope.outer_columns = identifier_names(&alias.column_aliases);
             let derived_scope = builder.build_child(derived_scope, &alias.this);
 
@@ -1219,8 +1242,7 @@ fn pivot_source_name(source: &Expression, explicit_alias: Option<&str>) -> Strin
 fn add_pivot_inner_scope(source: &Expression, scope: &mut Scope, builder: &mut ScopeBuilder) {
     match source {
         Expression::Subquery(subquery) => {
-            let derived_scope =
-                builder.branch(scope, subquery.this.clone(), ScopeType::DerivedTable);
+            let derived_scope = builder.branch(scope, &subquery.this, ScopeType::DerivedTable);
             let derived_scope = builder.build_child(derived_scope, &subquery.this);
             scope.derived_table_scopes.push(derived_scope);
         }
@@ -1297,7 +1319,7 @@ fn collect_subqueries_in_expr(
             continue;
         }
 
-        let sub_scope = builder.branch(parent_scope, query.clone(), ScopeType::Subquery);
+        let sub_scope = builder.branch(parent_scope, query, ScopeType::Subquery);
         let sub_scope = builder.build_child(sub_scope, query);
         parent_scope.subquery_scopes.push(sub_scope);
     }
@@ -2409,6 +2431,105 @@ mod tests {
             recorder.references.last().unwrap().child,
             scope.derived_table_scopes[0].id()
         );
+    }
+
+    /// Records the node `enter_scope` reports for each scope.
+    #[derive(Default)]
+    struct EnteredNodes(Vec<(ScopeType, *const Expression)>);
+
+    impl ScopeVisitor for EnteredNodes {
+        fn enter_scope(
+            &mut self,
+            _id: ScopeId,
+            _parent: Option<ScopeId>,
+            scope_type: ScopeType,
+            expression: &Expression,
+        ) {
+            self.0.push((scope_type, expression));
+        }
+    }
+
+    fn entered_nodes(ast: &Expression, scope_type: ScopeType) -> Vec<*const Expression> {
+        let mut visitor = EnteredNodes::default();
+        build_scope_with(ast, &mut visitor);
+        visitor
+            .0
+            .into_iter()
+            .filter(|(entered, _)| *entered == scope_type)
+            .map(|(_, node)| node)
+            .collect()
+    }
+
+    #[test]
+    fn test_visitor_enters_input_nodes() {
+        // The two scalar subqueries have identical bodies, so only their
+        // addresses tell them apart.
+        let ast = crate::parse(
+            "SELECT (SELECT 1) AS a, (SELECT 1) AS b",
+            Default::default(),
+        )
+        .expect("Failed to parse SQL");
+        let Expression::Select(select) = &ast[0] else {
+            panic!("expected a SELECT");
+        };
+        let expected: Vec<_> = select.expressions.iter().map(scope_query).collect();
+        let entered = entered_nodes(&ast[0], ScopeType::Subquery);
+        assert_eq!(entered.len(), 2);
+        for (entered, expected) in entered.into_iter().zip(expected) {
+            assert!(std::ptr::eq(entered, expected));
+        }
+
+        let ast = crate::parse("SELECT * FROM (SELECT 1) AS d", Default::default())
+            .expect("Failed to parse SQL");
+        let Expression::Select(select) = &ast[0] else {
+            panic!("expected a SELECT");
+        };
+        let derived = &select.from.as_ref().unwrap().expressions[0];
+        let entered = entered_nodes(&ast[0], ScopeType::DerivedTable);
+        assert_eq!(entered.len(), 1);
+        assert!(std::ptr::eq(entered[0], scope_query(derived)));
+
+        let ast = crate::parse("WITH c AS (SELECT 1) SELECT * FROM c", Default::default())
+            .expect("Failed to parse SQL");
+        let Expression::Select(select) = &ast[0] else {
+            panic!("expected a SELECT");
+        };
+        let cte = &select.with.as_ref().unwrap().ctes[0];
+        let entered = entered_nodes(&ast[0], ScopeType::Cte);
+        assert_eq!(entered.len(), 1);
+        assert!(!std::ptr::eq(entered[0], &cte.this));
+    }
+
+    #[test]
+    fn test_visitor_enters_cte_as_cte_expression() {
+        #[derive(Default)]
+        struct CteNames(Vec<String>);
+
+        impl ScopeVisitor for CteNames {
+            fn enter_scope(
+                &mut self,
+                _id: ScopeId,
+                _parent: Option<ScopeId>,
+                scope_type: ScopeType,
+                expression: &Expression,
+            ) {
+                if scope_type == ScopeType::Cte {
+                    let Expression::Cte(cte) = expression else {
+                        panic!("expected an Expression::Cte, got {expression:?}");
+                    };
+                    self.0.push(cte.alias.name.clone());
+                }
+            }
+        }
+
+        let ast = crate::parse(
+            "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b",
+            Default::default(),
+        )
+        .expect("Failed to parse SQL");
+        let mut visitor = CteNames::default();
+        build_scope_with(&ast[0], &mut visitor);
+        assert_eq!(visitor.0, ["a", "b"]);
     }
 
     #[test]

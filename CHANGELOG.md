@@ -13,6 +13,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   `ScopeVisitor`: scope entry and exit, each FROM/JOIN item in source order,
   and the FROM-item subtrees that get no scope. Every scope a build creates
   has a `ScopeId`, exposed as `Scope::id()`.
+- `scope_query` is now public and re-exported: it unwraps `Cte`, `Subquery`,
+  `Paren`, `Alias` and similar wrappers to the query a scope is built from.
+
+- `ScopeVisitor::enter_scope` now receives a node of the expression passed to
+  `build_scope_with` instead of a copy, as `reference` and `skipped` already
+  did, so callers can key on node addresses. A CTE scope is the exception: it
+  still receives an owned `Expression::Cte`, because the input holds CTEs as
+  `Cte` structs rather than `Expression` nodes. The scope tree is unchanged.
 
 ### Fixed
 
