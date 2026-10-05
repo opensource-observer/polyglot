@@ -3191,6 +3191,32 @@ mod tests {
     }
 
     #[test]
+    fn test_qualify_parenthesized_join_columns() {
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table(
+                "a",
+                &[("id".into(), DataType::Text), ("x".into(), DataType::Text)],
+                None,
+            )
+            .unwrap();
+        schema
+            .add_table(
+                "b",
+                &[("id".into(), DataType::Text), ("y".into(), DataType::Text)],
+                None,
+            )
+            .unwrap();
+        let sql = "SELECT x, y FROM (a JOIN b ON a.id = b.id) WHERE x = y";
+        let qualified =
+            qualify_columns(parse(sql), &schema, &QualifyColumnsOptions::new()).unwrap();
+        assert_eq!(
+            gen(&qualified),
+            "SELECT a.x AS x, b.y AS y FROM (a JOIN b ON a.id = b.id) WHERE a.x = b.y"
+        );
+    }
+
+    #[test]
     fn test_get_scope_columns() {
         let expr = parse("SELECT a, b FROM t WHERE c = 1");
         let scope = build_scope(&expr);

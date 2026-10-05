@@ -24,6 +24,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- `build_scope` now registers the relations inside a parenthesized join FROM
+  item, such as `(a JOIN b ON ...)`, so their columns resolve and qualify and
+  schema validation no longer reports them as unknown. An aliased join,
+  `(a JOIN b) AS j`, registers only `j`. `ScopeVisitor::reference` reports
+  the items inside the join at `depth + 1`, before the join itself, and
+  subqueries in an unaliased join's conditions now get subquery scopes.
 - `build_scope` now gives a subquery scope to a query in an expression field
   the scope walk skipped: an aggregate's `FILTER (WHERE ...)`, `ORDER BY` and
   `LIMIT`, a window frame bound, a `CAST` `FORMAT` or `DEFAULT` expression,
