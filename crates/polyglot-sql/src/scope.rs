@@ -1395,9 +1395,6 @@ impl<'a> WalkInScopeIter<'a> {
         let mut children = Vec::new();
 
         match expr {
-            Expression::Prepare(prepare) => {
-                children.push(&prepare.statement);
-            }
             Expression::Select(select) => {
                 // Walk SELECT expressions
                 for e in &select.expressions {
@@ -1455,131 +1452,17 @@ impl<'a> WalkInScopeIter<'a> {
                     children.push(&offset.this);
                 }
             }
-            Expression::And(bin)
-            | Expression::Or(bin)
-            | Expression::Add(bin)
-            | Expression::Sub(bin)
-            | Expression::Mul(bin)
-            | Expression::Div(bin)
-            | Expression::Mod(bin)
-            | Expression::Eq(bin)
-            | Expression::Neq(bin)
-            | Expression::Lt(bin)
-            | Expression::Lte(bin)
-            | Expression::Gt(bin)
-            | Expression::Gte(bin)
-            | Expression::BitwiseAnd(bin)
-            | Expression::BitwiseOr(bin)
-            | Expression::BitwiseXor(bin)
-            | Expression::Concat(bin) => {
-                children.push(&bin.left);
-                children.push(&bin.right);
-            }
-            Expression::Like(like) | Expression::ILike(like) => {
-                children.push(&like.left);
-                children.push(&like.right);
-                if let Some(escape) = &like.escape {
-                    children.push(escape);
-                }
-            }
-            Expression::Not(un) | Expression::Neg(un) | Expression::BitwiseNot(un) => {
-                children.push(&un.this);
-            }
-            Expression::Function(func) => {
-                for arg in &func.args {
-                    children.push(arg);
-                }
-            }
-            Expression::AggregateFunction(agg) => {
-                for arg in &agg.args {
-                    children.push(arg);
-                }
-            }
-            Expression::WindowFunction(wf) => {
-                children.push(&wf.this);
-                for e in &wf.over.partition_by {
-                    children.push(e);
-                }
-                for e in &wf.over.order_by {
-                    children.push(&e.this);
-                }
-            }
-            Expression::Alias(alias) => {
-                children.push(&alias.this);
-            }
-            Expression::Case(case) => {
-                if let Some(operand) = &case.operand {
-                    children.push(operand);
-                }
-                for (when_expr, then_expr) in &case.whens {
-                    children.push(when_expr);
-                    children.push(then_expr);
-                }
-                if let Some(else_clause) = &case.else_ {
-                    children.push(else_clause);
-                }
-            }
-            Expression::Paren(paren) => {
-                children.push(&paren.this);
-            }
-            Expression::Ordered(ord) => {
-                children.push(&ord.this);
-            }
+            Expression::Table(_) | Expression::Subquery(_) | Expression::Exists(_) => {}
+            // The query operand gets its own scope, so it is not walked here.
             Expression::In(in_expr) => {
-                children.push(&in_expr.this);
-                for e in &in_expr.expressions {
-                    children.push(e);
-                }
-                // Note: in_expr.query creates a new scope - don't traverse
+                children.extend(expr.children().into_iter().filter(|child| {
+                    !in_expr
+                        .query
+                        .as_ref()
+                        .is_some_and(|query| std::ptr::eq(query, *child))
+                }));
             }
-            Expression::Between(between) => {
-                children.push(&between.this);
-                children.push(&between.low);
-                children.push(&between.high);
-            }
-            Expression::IsNull(is_null) => {
-                children.push(&is_null.this);
-            }
-            Expression::Cast(cast) => {
-                children.push(&cast.this);
-            }
-            Expression::Extract(extract) => {
-                children.push(&extract.this);
-            }
-            Expression::Coalesce(coalesce) => {
-                for e in &coalesce.expressions {
-                    children.push(e);
-                }
-            }
-            Expression::NullIf(nullif) => {
-                children.push(&nullif.this);
-                children.push(&nullif.expression);
-            }
-            Expression::Table(_table) => {
-                // Tables don't have child expressions to traverse within scope
-                // (joins are handled at the Select level)
-            }
-            Expression::TryCatch(try_catch) => {
-                for stmt in &try_catch.try_body {
-                    children.push(stmt);
-                }
-                if let Some(catch_body) = &try_catch.catch_body {
-                    for stmt in catch_body {
-                        children.push(stmt);
-                    }
-                }
-            }
-            Expression::Column(_) | Expression::Literal(_) | Expression::Identifier(_) => {
-                // Leaf nodes - no children
-            }
-            // Subqueries and Exists create new scopes - don't traverse into them
-            Expression::Subquery(_) | Expression::Exists(_) => {}
-            _ => {
-                // Use the canonical AST traversal for other scalar expressions
-                // (typed functions, field access, filters, etc.). Scope
-                // boundaries are still enforced by should_stop_at.
-                children.extend(expr.children());
-            }
+            _ => children.extend(expr.children()),
         }
 
         children
@@ -2105,6 +1988,52 @@ mod tests {
             assert_eq!(scope.subquery_scopes.len(), 1, "{sql}");
             assert!(scope.subquery_scopes[0].is_subquery(), "{sql}");
             assert!(scope.subquery_scopes[0].sources.contains_key("u"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_subquery_in_expression_field_is_one_subquery_scope() {
+        use crate::DialectType::{BigQuery, Generic, Oracle, PostgreSQL};
+
+        for (dialect, sql) in [
+            (
+                PostgreSQL,
+                "SELECT json_agg(u.a) FILTER (WHERE u.a > (SELECT max(t.x) FROM t)) FROM u",
+            ),
+            (
+                PostgreSQL,
+                "SELECT json_agg(u.a) FILTER (WHERE u.a = ARRAY(SELECT t.x FROM t)) FROM u",
+            ),
+            (
+                PostgreSQL,
+                "SELECT json_agg(u.a ORDER BY (SELECT max(t.x) FROM t)) FROM u",
+            ),
+            (
+                Generic,
+                "SELECT SUM(u.a) OVER (ORDER BY u.a ROWS BETWEEN (SELECT max(t.x) FROM t) \
+                 PRECEDING AND CURRENT ROW) FROM u",
+            ),
+            (
+                BigQuery,
+                "SELECT CAST(u.a AS STRING FORMAT ARRAY_TO_STRING(ARRAY(SELECT t.x FROM t), ',')) FROM u",
+            ),
+            (
+                Oracle,
+                "SELECT CAST(u.a AS NUMBER DEFAULT (SELECT max(t.x) FROM t) ON CONVERSION ERROR) \
+                 FROM u",
+            ),
+            (
+                BigQuery,
+                "SELECT u.a IN UNNEST(ARRAY(SELECT t.x FROM t)) FROM u",
+            ),
+        ] {
+            let ast = crate::parse(sql, dialect).expect("Failed to parse SQL");
+            let scope = build_scope(&ast[0]);
+            assert_eq!(scope.subquery_scopes.len(), 1, "{sql}");
+            let subquery = &scope.subquery_scopes[0];
+            assert!(subquery.is_subquery(), "{sql}");
+            assert!(subquery.sources.contains_key("t"), "{sql}");
+            assert!(!scope.sources.contains_key("t"), "{sql}");
         }
     }
 
