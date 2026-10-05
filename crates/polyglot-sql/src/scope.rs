@@ -1667,6 +1667,10 @@ where
 ///
 /// Returns a list of all scopes in depth-first post-order.
 ///
+/// Each returned scope is a deep clone that carries its whole subtree, so
+/// memory grows quadratically with nesting depth. Callers that only read the
+/// scopes should use `build_scope(..).traverse()`, which borrows them.
+///
 /// # Arguments
 /// * `expression` - The expression to traverse
 ///
