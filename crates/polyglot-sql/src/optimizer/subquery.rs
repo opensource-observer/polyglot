@@ -1437,8 +1437,8 @@ mod tests {
     #[test]
     fn test_is_mergeable_simple() {
         let expr = parse("SELECT a FROM (SELECT x.a FROM x) AS y");
-        let scopes = crate::scope::traverse_scope(&expr);
-        assert!(!scopes.is_empty());
+        let root = crate::scope::build_scope(&expr);
+        assert!(!root.traverse().is_empty());
     }
 
     #[test]
