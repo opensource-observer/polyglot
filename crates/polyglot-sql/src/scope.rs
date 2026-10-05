@@ -1695,6 +1695,16 @@ mod tests {
     }
 
     #[test]
+    fn test_in_parenthesized_set_operation_is_a_subquery_scope() {
+        let scope = parse_and_build_scope(
+            "SELECT * FROM t WHERE x IN ((SELECT a FROM u) UNION (SELECT b FROM v))",
+        );
+
+        assert_eq!(scope.subquery_scopes.len(), 1);
+        assert_eq!(scope.subquery_scopes[0].union_scopes.len(), 2);
+    }
+
+    #[test]
     fn test_union_output_columns() {
         let scope = parse_and_build_scope(
             "SELECT id, name FROM customers UNION ALL SELECT id, name FROM employees",
