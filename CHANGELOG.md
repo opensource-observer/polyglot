@@ -24,6 +24,14 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- `build_scope` now gives a subquery scope to a query in an expression field
+  the scope walk skipped: an aggregate's `FILTER (WHERE ...)`, `ORDER BY` and
+  `LIMIT`, a window frame bound, a `CAST` `FORMAT` or `DEFAULT` expression,
+  `IN UNNEST(...)`, and the other fields of those nodes it did not list. The
+  walk now takes the children of these nodes from the AST traversal instead of
+  a hand-written field list. As a result `walk_in_scope` and `find_all_in_scope`
+  also yield the nodes in those positions, such as columns in a `FILTER` clause
+  or window frame bound; the scope boundaries are unchanged.
 - `build_scope` now gives a subquery scope to a query that is a bare operand of
   an expression, such as the argument of `ARRAY(SELECT ...)`, instead of
   leaving its tables and columns out of the scope tree. This matches sqlglot,
