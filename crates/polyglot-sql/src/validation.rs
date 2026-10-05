@@ -3758,7 +3758,11 @@ fn validate_statement_with_schema(
                     // Validate the source as a query, not as a bare SELECT in
                     // a synthetic projection (which is not a scalar subquery).
                     // The leading CTEs were already checked in the DML scope.
-                    let source = crate::scope::build_scope_with_ctes(query, &scope.cte_sources);
+                    let source = crate::scope::build_scope_with_ctes(
+                        query,
+                        &scope.cte_sources,
+                        &mut crate::scope::NoopScopeVisitor,
+                    );
                     // INSERT does not expose its target columns to the source.
                     // An empty enclosing scope also disables standalone-schema
                     // fallback for source queries without a FROM clause.

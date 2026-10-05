@@ -132,8 +132,8 @@ pub use schema::{
 };
 #[cfg(feature = "semantic")]
 pub use scope::{
-    build_scope, find_all_in_scope, find_in_scope, traverse_scope, walk_in_scope, ColumnRef, Scope,
-    ScopeType, SourceInfo,
+    build_scope, build_scope_with, find_all_in_scope, find_in_scope, traverse_scope, walk_in_scope,
+    ColumnRef, NoopScopeVisitor, Scope, ScopeId, ScopeType, ScopeVisitor, SourceInfo,
 };
 #[cfg(feature = "time")]
 pub use time::{format_time, is_valid_timezone, subsecond_precision, TIMEZONES};
