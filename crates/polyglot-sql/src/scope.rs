@@ -774,7 +774,8 @@ pub trait ScopeVisitor {
     /// items inside it: they are still built and reported, with
     /// `registered_as` set to the name each binds inside the join, but they
     /// add no entry to [`Scope::sources`], so for them `registered_as` is not
-    /// a key into it.
+    /// a key into it. An aliased `MATCH_RECOGNIZE` hides its input relation
+    /// the same way.
     fn reference(
         &mut self,
         _scope: ScopeId,
@@ -1071,6 +1072,17 @@ fn add_from_item(
             builder,
         );
         (name, None)
+    } else if let Expression::MatchRecognize(match_recognize) = item {
+        let name = add_match_recognize_to_scope(
+            item,
+            (match_recognize.this.as_deref(), match_recognize.alias.as_ref()),
+            depth,
+            next_index,
+            scope,
+            preceding_sources,
+            builder,
+        );
+        (name, None)
     } else {
         let first_child = scope.derived_table_scopes.len();
         let name = add_table_to_scope(item, scope, preceding_sources, builder);
@@ -1121,11 +1133,31 @@ fn add_joined_table_to_scope(
     preceding_sources: &mut HashSet<String>,
     builder: &mut ScopeBuilder,
 ) -> Option<String> {
-    // The relations inside an aliased join still see each other, and the
-    // items before the join, as LATERAL inputs, so they are registered as
-    // usual and the enclosing names restored afterwards.
-    let enclosing = alias.map(|_| (scope.sources.clone(), preceding_sources.clone()));
+    let Some(alias) = alias else {
+        add_join_items(joined, depth, next_index, scope, preceding_sources, builder);
+        return None;
+    };
+    hide_names(scope, preceding_sources, |scope, preceding_sources| {
+        add_join_items(joined, depth, next_index, scope, preceding_sources, builder);
+        // A subquery in these conditions may refer to the hidden names, which a
+        // child scope could not resolve, so the conditions are left unscoped.
+        for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
+    });
+    scope.add_source_info(
+        alias.name.clone(),
+        SourceInfo::new(item.clone(), false, SourceKind::DerivedTable),
+    );
+    Some(alias.name.clone())
+}
 
+fn add_join_items(
+    joined: &JoinedTable,
+    depth: usize,
+    next_index: &mut usize,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+    builder: &mut ScopeBuilder,
+) {
     for inner in std::iter::once(&joined.left).chain(joined.joins.iter().map(|join| &join.this)) {
         add_from_item(
             inner,
@@ -1141,20 +1173,64 @@ fn add_joined_table_to_scope(
             preceding_sources.insert(name);
         }
     }
+}
 
-    let (Some(alias), Some((sources, preceding))) = (alias, enclosing) else {
+/// Registers a `MATCH_RECOGNIZE` item with the given input relation and
+/// alias.
+///
+/// An alias is registered as a source with no scope of its own, and it hides
+/// the input relation, which is still built and reported one depth below the
+/// item. Without an alias, the item is reported whole through `skipped`.
+/// Returns the alias, if any.
+fn add_match_recognize_to_scope(
+    item: &Expression,
+    (input, alias): (Option<&Expression>, Option<&Identifier>),
+    depth: usize,
+    next_index: &mut usize,
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+    builder: &mut ScopeBuilder,
+) -> Option<String> {
+    let Some(alias) = alias else {
+        builder.skipped(scope, item);
         return None;
     };
-    // A subquery in these conditions may refer to the hidden names, which a
-    // child scope could not resolve, so the conditions are left unscoped.
-    for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
-    scope.sources = sources;
-    *preceding_sources = preceding;
+    if let Some(input) = input {
+        hide_names(scope, preceding_sources, |scope, preceding_sources| {
+            add_from_item(
+                input,
+                depth + 1,
+                next_index,
+                scope,
+                preceding_sources,
+                builder,
+            );
+        });
+    }
+    builder.skip_children(scope, item, &["this"]);
     scope.add_source_info(
         alias.name.clone(),
         SourceInfo::new(item.clone(), false, SourceKind::DerivedTable),
     );
     Some(alias.name.clone())
+}
+
+/// Runs `register`, then drops the names it added to `scope` and restores any
+/// enclosing ones they displaced.
+///
+/// The relations behind an alias are registered as usual first, so that they
+/// see each other, and the items before them, as LATERAL inputs.
+fn hide_names(
+    scope: &mut Scope,
+    preceding_sources: &mut HashSet<String>,
+    register: impl FnOnce(&mut Scope, &mut HashSet<String>),
+) {
+    let sources = scope.sources.clone();
+    let preceding = preceding_sources.clone();
+    register(scope, preceding_sources);
+    scope.sources = sources;
+    *preceding_sources = preceding;
+    scope.clear_cache();
 }
 
 /// Calls `f` on each join condition in `joined`, including those of unaliased
@@ -1266,13 +1342,10 @@ fn add_table_to_scope(
             Some(alias.alias.name.clone())
         }
         Expression::Alias(alias) => match &alias.this {
-            Expression::Unnest(_) => {
+            Expression::Unnest(_) | Expression::Function(_) => {
                 builder.skip_children(scope, &alias.this, &[]);
                 scope.add_virtual_source(alias.alias.name.clone(), expr.clone());
                 Some(alias.alias.name.clone())
-            }
-            Expression::Function(_) => {
-                add_table_to_scope(&alias.this, scope, preceding_sources, builder)
             }
             _ => {
                 builder.skipped(scope, expr);
@@ -2664,6 +2737,62 @@ mod tests {
                 (1, 0, Some("j")),
                 (4, 0, Some("c")),
             ]
+        );
+    }
+
+    #[test]
+    fn test_aliased_table_function_is_a_virtual_source() {
+        use crate::DialectType::PostgreSQL;
+
+        for sql in [
+            "SELECT * FROM t, my_func(t.x) AS g",
+            "SELECT * FROM t, my_func(t.x) g",
+            "SELECT * FROM t, my_func(t.x) AS g(y, z)",
+        ] {
+            let (scope, recorder) = record(sql, PostgreSQL);
+            assert_eq!(sorted_keys(&scope.sources), ["g", "t"], "{sql}");
+            assert_eq!(scope.sources["g"].kind, SourceKind::Virtual, "{sql}");
+            assert_eq!(
+                from_items(&recorder),
+                [(0, 0, Some("t")), (1, 0, Some("g"))],
+                "{sql}"
+            );
+            assert_eq!(recorder.skipped.len(), 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_aliased_match_recognize_hides_its_input() {
+        use crate::DialectType::{Oracle, Snowflake};
+
+        let sql = "SELECT * FROM t MATCH_RECOGNIZE (PARTITION BY k ORDER BY tstamp \
+                   MEASURES FIRST(A.tstamp) AS start_tstamp PATTERN (A B*) \
+                   DEFINE B AS B.v > PREV(B.v)) AS m";
+        for dialect in [Snowflake, Oracle] {
+            let (scope, recorder) = record(sql, dialect);
+            assert_eq!(sorted_keys(&scope.sources), ["m"]);
+            let source = &scope.sources["m"];
+            assert_eq!(
+                (source.kind, source.is_scope),
+                (SourceKind::DerivedTable, false)
+            );
+            assert_eq!(
+                from_items(&recorder),
+                [(1, 1, Some("t")), (0, 0, Some("m"))]
+            );
+            assert!(!recorder.skipped.is_empty());
+        }
+
+        // The input's name stays hidden from a LATERAL item after it.
+        let (scope, _) = record(
+            "SELECT * FROM t MATCH_RECOGNIZE (ORDER BY v PATTERN (A) DEFINE A AS TRUE) AS m, \
+             LATERAL (SELECT m.v) AS l",
+            Snowflake,
+        );
+        assert_eq!(sorted_keys(&scope.sources), ["l", "m"]);
+        assert_eq!(
+            sorted_keys(&scope.derived_table_scopes[0].lateral_sources),
+            ["m"]
         );
     }
 

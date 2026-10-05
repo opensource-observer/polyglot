@@ -271,6 +271,13 @@ impl<'a> Resolver<'a> {
             Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
                 alias_output_columns(alias)
             }
+            // A table function's output columns are unknown unless the alias
+            // lists them.
+            Expression::Alias(alias) if matches!(&alias.this, Expression::Function(_)) => alias
+                .column_aliases
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
             Expression::Alias(alias) => {
                 let columns = self.get_source_columns_for_expression(&alias.this)?;
                 apply_alias_columns(columns, &alias.column_aliases)
@@ -469,6 +476,13 @@ impl<'a> Resolver<'a> {
             Expression::Alias(alias) if matches!(&alias.this, Expression::Unnest(_)) => {
                 alias_output_columns(alias)
             }
+            // A table function's output columns are unknown unless the alias
+            // lists them.
+            Expression::Alias(alias) if matches!(&alias.this, Expression::Function(_)) => alias
+                .column_aliases
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
             Expression::Alias(alias) => {
                 let columns = self.get_source_output_columns(&alias.this);
                 apply_alias_columns(columns, &alias.column_aliases)

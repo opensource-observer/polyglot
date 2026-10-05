@@ -3217,6 +3217,21 @@ mod tests {
     }
 
     #[test]
+    fn test_qualify_aliased_table_function_columns() {
+        let mut schema = MappingSchema::new();
+        schema
+            .add_table("t", &[("x".into(), DataType::Text)], None)
+            .unwrap();
+        let sql = "SELECT x, y FROM t, my_func(t.x) AS g(y)";
+        let qualified =
+            qualify_columns(parse(sql), &schema, &QualifyColumnsOptions::new()).unwrap();
+        assert_eq!(
+            gen(&qualified),
+            "SELECT t.x AS x, g.y AS y FROM t, MY_FUNC(t.x) AS g(y)"
+        );
+    }
+
+    #[test]
     fn test_get_scope_columns() {
         let expr = parse("SELECT a, b FROM t WHERE c = 1");
         let scope = build_scope(&expr);
