@@ -1297,32 +1297,46 @@ fn collect_subqueries_in_expr(
     builder: &mut ScopeBuilder,
 ) {
     let mut seen = HashSet::new();
+    let walker = WalkInScopeIter::new(expr, false);
     for node in walk_in_scope(expr, false) {
-        let query = match node {
+        let operand = match node {
             Expression::Subquery(subquery) if subquery.alias.is_none() => {
                 Some(scope_query(&subquery.this))
             }
             Expression::Exists(exists) => Some(&exists.this),
             Expression::In(in_expr) => in_expr.query.as_ref(),
             Expression::Any(quantified) | Expression::All(quantified) => {
-                Some(scope_query(&quantified.subquery))
+                Some(scope_query(&quantified.subquery)).filter(|query| is_bare_query(query))
             }
             _ => None,
         };
+        // The walk stops at a bare query, so find it among its parent's children.
+        let bare = walker
+            .get_children(node)
+            .into_iter()
+            .filter(|child| is_bare_query(child));
 
-        let Some(query) = query else {
-            continue;
-        };
+        for query in operand.into_iter().chain(bare) {
+            let key = query as *const Expression as usize;
+            if !seen.insert(key) {
+                continue;
+            }
 
-        let key = query as *const Expression as usize;
-        if !seen.insert(key) {
-            continue;
+            let sub_scope = builder.branch(parent_scope, query, ScopeType::Subquery);
+            let sub_scope = builder.build_child(sub_scope, query);
+            parent_scope.subquery_scopes.push(sub_scope);
         }
-
-        let sub_scope = builder.branch(parent_scope, query, ScopeType::Subquery);
-        let sub_scope = builder.build_child(sub_scope, query);
-        parent_scope.subquery_scopes.push(sub_scope);
     }
+}
+
+fn is_bare_query(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::Select(_)
+            | Expression::Union(_)
+            | Expression::Intersect(_)
+            | Expression::Except(_)
+    )
 }
 
 /// Walk within a scope, yielding expressions without crossing scope boundaries.
@@ -1374,17 +1388,7 @@ impl<'a> WalkInScopeIter<'a> {
         }
 
         // Stop at standalone SELECT/UNION/etc that would be subqueries
-        if matches!(
-            expr,
-            Expression::Select(_)
-                | Expression::Union(_)
-                | Expression::Intersect(_)
-                | Expression::Except(_)
-        ) {
-            return true;
-        }
-
-        false
+        is_bare_query(expr)
     }
 
     fn get_children(&self, expr: &'a Expression) -> Vec<&'a Expression> {
@@ -2048,6 +2052,87 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn test_function_argument_query_is_one_subquery_scope() {
+        use crate::DialectType::{BigQuery, ClickHouse, Generic, PostgreSQL};
+
+        for (dialect, sql) in [
+            (Generic, "SELECT ARRAY(SELECT x FROM u) FROM t"),
+            (BigQuery, "SELECT ARRAY(SELECT x FROM u) FROM t"),
+            (PostgreSQL, "SELECT ARRAY(SELECT x FROM u) FROM t"),
+            (
+                Generic,
+                "SELECT 1 FROM t WHERE LENGTH(ARRAY(SELECT x FROM u)) > 0",
+            ),
+            (Generic, "SELECT 1 FROM t GROUP BY ARRAY(SELECT x FROM u)"),
+            (
+                Generic,
+                "SELECT 1 FROM t HAVING ARRAY(SELECT x FROM u) = t.a",
+            ),
+            (Generic, "SELECT 1 FROM t ORDER BY ARRAY(SELECT x FROM u)"),
+            (
+                Generic,
+                "SELECT 1 FROM t JOIN s ON ARRAY(SELECT x FROM u) = s.a",
+            ),
+            (
+                Generic,
+                "SELECT 1 FROM t QUALIFY ARRAY(SELECT x FROM u) = t.a",
+            ),
+            (ClickHouse, "SELECT f(SELECT x FROM u) FROM t"),
+        ] {
+            let ast = crate::parse(sql, dialect).expect("Failed to parse SQL");
+            let scope = build_scope(&ast[0]);
+            assert_eq!(scope.subquery_scopes.len(), 1, "{sql}");
+            let subquery = &scope.subquery_scopes[0];
+            assert!(subquery.is_subquery(), "{sql}");
+            assert!(subquery.sources.contains_key("u"), "{sql}");
+            assert!(!scope.sources.contains_key("u"), "{sql}");
+        }
+
+        let scope =
+            parse_and_build_scope("SELECT ARRAY(SELECT x FROM u UNION ALL SELECT y FROM v) FROM t");
+        assert_eq!(scope.subquery_scopes.len(), 1);
+        assert_eq!(scope.subquery_scopes[0].union_scopes.len(), 2);
+
+        // An array operand of ANY/ALL is not a query, so only its inner query gets a scope.
+        for sql in [
+            "SELECT 1 FROM t WHERE x = ANY(ARRAY(SELECT y FROM u))",
+            "SELECT 1 FROM t WHERE x = ALL(ARRAY(SELECT y FROM u))",
+        ] {
+            let scope = parse_and_build_scope(sql);
+            assert_eq!(scope.subquery_scopes.len(), 1, "{sql}");
+            assert!(scope.subquery_scopes[0].is_subquery(), "{sql}");
+            assert!(scope.subquery_scopes[0].sources.contains_key("u"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_nested_and_mixed_subquery_operands_register_once() {
+        let scope = parse_and_build_scope(
+            "SELECT ARRAY(SELECT ARRAY(SELECT z FROM w) FROM u), \
+                    (SELECT 1 FROM v) \
+             FROM t WHERE a IN (SELECT 1 FROM u) AND EXISTS (SELECT 1 FROM u)",
+        );
+        assert_eq!(scope.subquery_scopes.len(), 4);
+        let array_arg = &scope.subquery_scopes[0];
+        assert_eq!(array_arg.subquery_scopes.len(), 1);
+        assert!(array_arg.subquery_scopes[0].sources.contains_key("w"));
+    }
+
+    #[test]
+    fn test_visitor_reports_function_argument_query() {
+        let (scope, recorder) = record(
+            "SELECT ARRAY(SELECT x FROM u) FROM t",
+            crate::DialectType::Generic,
+        );
+        let [root, subquery] = &recorder.entered[..] else {
+            panic!("expected a root scope and one subquery scope");
+        };
+        assert_eq!(scope.subquery_scopes[0].id(), Some(subquery.id));
+        assert_eq!(subquery.parent, Some(root.id));
+        assert!(matches!(subquery.scope_type, ScopeType::Subquery));
     }
 
     #[test]
