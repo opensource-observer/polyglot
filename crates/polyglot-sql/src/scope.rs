@@ -5,7 +5,7 @@
 //!
 //! Ported from sqlglot's optimizer/scope.py
 
-use crate::expressions::Expression;
+use crate::expressions::{Expression, Identifier};
 use crate::traversal::ExpressionWalk;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -996,6 +996,7 @@ fn process_ctes(
         let cte_name = cte.alias.name.clone();
         let cte_expr = Expression::Cte(Box::new(cte.clone()));
         let mut cte_scope = builder.branch(current_scope, cte_expr.clone(), ScopeType::Cte);
+        cte_scope.outer_columns = identifier_names(&cte.columns);
 
         if with.recursive && cte_body_self_references(cte) {
             cte_scope.add_cte_source(cte_name.clone(), cte_expr.clone());
@@ -1065,6 +1066,7 @@ fn add_table_to_scope(
 
             let mut derived_scope =
                 builder.branch(scope, subquery.this.clone(), ScopeType::DerivedTable);
+            derived_scope.outer_columns = identifier_names(&subquery.column_aliases);
             if subquery.lateral {
                 derived_scope.is_lateral = true;
                 derived_scope.can_be_correlated = true;
@@ -1102,14 +1104,9 @@ fn add_table_to_scope(
             Some(name)
         }
         Expression::Alias(alias) if is_query_like_relation(&alias.this) => {
-            let outer_columns = alias
-                .column_aliases
-                .iter()
-                .map(|column| column.name.clone())
-                .collect::<Vec<_>>();
             let mut derived_scope =
                 builder.branch(scope, alias.this.clone(), ScopeType::DerivedTable);
-            derived_scope.outer_columns = outer_columns;
+            derived_scope.outer_columns = identifier_names(&alias.column_aliases);
             let derived_scope = builder.build_child(derived_scope, &alias.this);
 
             scope.add_source(alias.alias.name.clone(), expr.clone(), true);
@@ -1176,6 +1173,13 @@ fn add_table_to_scope(
             None
         }
     }
+}
+
+fn identifier_names(identifiers: &[Identifier]) -> Vec<String> {
+    identifiers
+        .iter()
+        .map(|identifier| identifier.name.clone())
+        .collect()
 }
 
 fn is_query_like_relation(expr: &Expression) -> bool {
@@ -1924,6 +1928,47 @@ mod tests {
 
         assert_eq!(child.outer_columns, vec!["col1", "col2"]);
         assert!(child.can_be_correlated); // Subqueries are correlated
+    }
+
+    fn first_from_item(sql: &str) -> Expression {
+        let ast = Parser::parse_sql(sql).expect("Failed to parse SQL");
+        match &ast[0] {
+            Expression::Select(select) => select.from.as_ref().unwrap().expressions[0].clone(),
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_derived_table_outer_columns() {
+        let scope = parse_and_build_scope("SELECT q.a FROM (SELECT 1, 2) AS q(a, b)");
+        assert_eq!(scope.derived_table_scopes[0].outer_columns, ["a", "b"]);
+
+        let scope = parse_and_build_scope("SELECT q.x FROM (SELECT 1 AS x) AS q");
+        assert!(scope.derived_table_scopes[0].outer_columns.is_empty());
+    }
+
+    #[test]
+    fn test_parenthesized_derived_table_outer_columns() {
+        let sql = "SELECT q.a FROM ((SELECT 1)) AS q(a)";
+        assert!(matches!(first_from_item(sql), Expression::Alias(_)));
+
+        let scope = parse_and_build_scope(sql);
+        assert_eq!(scope.derived_table_scopes[0].outer_columns, ["a"]);
+    }
+
+    #[test]
+    fn test_cte_outer_columns() {
+        let scope = parse_and_build_scope("WITH c(a, b) AS (SELECT 1, 2) SELECT a FROM c");
+        assert_eq!(scope.cte_scopes[0].outer_columns, ["a", "b"]);
+
+        let scope = parse_and_build_scope("WITH c AS (SELECT 1 AS x) SELECT x FROM c");
+        assert!(scope.cte_scopes[0].outer_columns.is_empty());
+
+        let scope = parse_and_build_scope(
+            "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) \
+             SELECT n FROM c",
+        );
+        assert_eq!(scope.cte_scopes[0].outer_columns, ["n"]);
     }
 
     #[test]

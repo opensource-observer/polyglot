@@ -45,6 +45,10 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   subqueries. `x = ANY (SELECT k FROM u)` previously produced two
   `subquery_scopes`. A subquery wrapped in extra parentheses, such as
   `x = ((SELECT k FROM u))`, is likewise registered once.
+- `Scope::outer_columns` is now filled for derived tables parsed as
+  `(SELECT ...) AS q(a, b)` and for CTEs declared as `WITH c(a, b) AS (...)`.
+  Previously it was set only for a parenthesized derived table, so most
+  renamed scopes reported an empty list.
 
 ## [0.13.1] - 2026-09-30
 
