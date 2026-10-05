@@ -24,6 +24,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ### Fixed
 
+- `build_scope` now gives a subquery scope to a query that is a bare operand of
+  an expression, such as the argument of `ARRAY(SELECT ...)`, instead of
+  leaving its tables and columns out of the scope tree. This matches sqlglot,
+  which treats every unwrapped query in scope as a subquery. An `ANY`/`ALL`
+  array operand such as `ANY(ARRAY(SELECT ...))` no longer gets an empty scope
+  of its own, so that expression now yields one subquery scope instead of two.
 - `qualify_tables`, `validate_qualify_columns` and `pushdown_projections` no
   longer deep-clone every scope through `traverse_scope`. That made memory use
   grow roughly cubically with derived-table nesting depth (`qualify_tables` on
