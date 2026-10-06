@@ -30,6 +30,13 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   `(a JOIN b) AS j`, registers only `j`. `ScopeVisitor::reference` reports
   the items inside the join at `depth + 1`, before the join itself, and
   subqueries in an unaliased join's conditions now get subquery scopes.
+- `build_scope` now registers an aliased table function FROM item, such as
+  `my_func(x) AS g(y, z)`, as a virtual source, so `g.y` qualifies and its
+  lineage reaches the function's arguments under a `_N` virtual source name.
+  Without a schema, an unqualified column is resolved among all FROM items,
+  the function included, so `SELECT a FROM t, my_func(t.x) AS g` no longer
+  assumes `t.a`. An aliased `MATCH_RECOGNIZE` is registered as its alias,
+  which hides its input relation.
 - `build_scope` now gives a subquery scope to a query in an expression field
   the scope walk skipped: an aggregate's `FILTER (WHERE ...)`, `ORDER BY` and
   `LIMIT`, a window frame bound, a `CAST` `FORMAT` or `DEFAULT` expression,

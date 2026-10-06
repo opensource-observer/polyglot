@@ -5023,6 +5023,29 @@ FROM UNNEST(GENERATE_DATE_ARRAY('2024-01-01', '2024-12-31', INTERVAL 1 WEEK)) AS
     }
 
     #[test]
+    fn test_lineage_aliased_table_function_is_a_virtual_source() {
+        let expr = parse_one(
+            "SELECT g.y AS out FROM t, my_func(t.x) AS g(y)",
+            DialectType::PostgreSQL,
+        )
+        .expect("parse");
+
+        let node = lineage("out", &expr, Some(DialectType::PostgreSQL), false).expect("lineage");
+        let child = node.downstream.first().expect("out should have lineage");
+
+        assert_eq!(child.name, "_0.y");
+        assert_eq!(child.source_kind, SourceKind::Virtual);
+        assert_eq!(child.source_alias.as_deref(), Some("g"));
+        assert!(
+            child
+                .downstream
+                .iter()
+                .any(|argument| argument.name == "t.x"),
+            "the function's argument should be lineage of its output"
+        );
+    }
+
+    #[test]
     fn test_lineage_real_table_named_like_unnest_alias_is_not_virtual() {
         let expr =
             parse_one("SELECT date_val.id FROM date_val", DialectType::BigQuery).expect("parse");
