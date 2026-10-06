@@ -705,22 +705,14 @@ fn unnest_output_columns(unnest: &crate::expressions::UnnestFunc) -> Vec<String>
 
 /// A table function's output columns are unknown unless its alias lists them.
 fn table_function_output_columns(alias: &crate::expressions::Alias) -> Vec<String> {
-    alias
-        .column_aliases
-        .iter()
-        .map(|column| column.name.clone())
-        .collect()
+    identifier_names(&alias.column_aliases)
 }
 
 fn alias_output_columns(alias: &crate::expressions::Alias) -> Vec<String> {
     if alias.column_aliases.is_empty() {
         vec![alias.alias.name.clone()]
     } else {
-        alias
-            .column_aliases
-            .iter()
-            .map(|column| column.name.clone())
-            .collect()
+        identifier_names(&alias.column_aliases)
     }
 }
 
@@ -733,10 +725,13 @@ fn lateral_output_columns(lateral: &crate::expressions::Lateral) -> Vec<String> 
 }
 
 fn lateral_view_output_columns(lateral_view: &crate::expressions::LateralView) -> Vec<String> {
-    lateral_view
-        .column_aliases
+    identifier_names(&lateral_view.column_aliases)
+}
+
+fn identifier_names(identifiers: &[Identifier]) -> Vec<String> {
+    identifiers
         .iter()
-        .map(|column| column.name.clone())
+        .map(|identifier| identifier.name.clone())
         .collect()
 }
 

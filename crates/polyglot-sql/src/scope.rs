@@ -1143,17 +1143,17 @@ fn add_joined_table_to_scope(
         add_join_items(joined, depth, next_index, scope, preceding_sources, builder);
         return None;
     };
-    hide_names(scope, preceding_sources, |scope, preceding_sources| {
-        add_join_items(joined, depth, next_index, scope, preceding_sources, builder);
-        // A subquery in these conditions may refer to the hidden names, which a
-        // child scope could not resolve, so the conditions are left unscoped.
-        for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
-    });
-    scope.add_source_info(
-        alias.name.clone(),
-        SourceInfo::new(item.clone(), false, SourceKind::DerivedTable),
+    let name = add_behind_alias(
+        item,
+        alias,
+        scope,
+        preceding_sources,
+        |scope, preceding_sources| {
+            add_join_items(joined, depth, next_index, scope, preceding_sources, builder);
+            skip_join_conditions(joined, scope, builder);
+        },
     );
-    Some(alias.name.clone())
+    Some(name)
 }
 
 /// Registers the relations and lateral views of `joined` one depth below
@@ -1203,8 +1203,15 @@ fn add_match_recognize_to_scope(
         builder.skipped(scope, item);
         return None;
     };
-    if let Some(input) = input {
-        hide_names(scope, preceding_sources, |scope, preceding_sources| {
+    let name = add_behind_alias(
+        item,
+        alias,
+        scope,
+        preceding_sources,
+        |scope, preceding_sources| {
+            let Some(input) = input else {
+                return;
+            };
             add_from_item(
                 input,
                 depth + 1,
@@ -1213,36 +1220,47 @@ fn add_match_recognize_to_scope(
                 preceding_sources,
                 builder,
             );
-            // As in an aliased join, these conditions may use hidden names.
             if let Some((joined, None)) = parenthesized_join(input) {
-                for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
+                skip_join_conditions(joined, scope, builder);
             }
-        });
-    }
-    builder.skip_children(scope, item, &["this"]);
-    scope.add_source_info(
-        alias.name.clone(),
-        SourceInfo::new(item.clone(), false, SourceKind::DerivedTable),
+        },
     );
-    Some(alias.name.clone())
+    builder.skip_children(scope, item, &["this"]);
+    Some(name)
 }
 
-/// Runs `register`, then restores `scope.sources` and `preceding_sources` to
-/// what they were before it, so the names it registered are hidden again.
+/// Registers `item` in `scope` as a source named `alias` with no scope of its
+/// own, hiding the relations `register` adds behind it. Returns the alias.
 ///
-/// The relations behind an alias are registered as usual first, so that they
-/// see each other, and the items before them, as LATERAL inputs.
-fn hide_names(
+/// The relations behind the alias are registered as usual first, so that they
+/// see each other, and the items before them, as LATERAL inputs. Then
+/// `scope.sources` and `preceding_sources` are restored to what they were
+/// before, so those names are hidden again.
+fn add_behind_alias(
+    item: &Expression,
+    alias: &Identifier,
     scope: &mut Scope,
     preceding_sources: &mut HashSet<String>,
     register: impl FnOnce(&mut Scope, &mut HashSet<String>),
-) {
+) -> String {
     let sources = scope.sources.clone();
     let preceding = preceding_sources.clone();
     register(scope, preceding_sources);
     scope.sources = sources;
     *preceding_sources = preceding;
-    scope.clear_cache();
+    scope.add_source_info(
+        alias.name.clone(),
+        SourceInfo::new(item.clone(), false, SourceKind::DerivedTable),
+    );
+    alias.name.clone()
+}
+
+/// Reports the join conditions of `joined` through `skipped`.
+///
+/// A subquery in these conditions may refer to names an alias hides, which a
+/// child scope could not resolve, so the conditions are left unscoped.
+fn skip_join_conditions(joined: &JoinedTable, scope: &Scope, builder: &mut ScopeBuilder) {
+    for_each_join_condition(joined, &mut |condition| builder.skipped(scope, condition));
 }
 
 /// Calls `f` on each join condition in `joined`, including those of unaliased
