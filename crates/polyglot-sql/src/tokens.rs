@@ -1537,7 +1537,8 @@ pub struct TokenizerConfig {
     pub dollar_sign_is_identifier: bool,
     /// Whether `@name` is a parameter (sqlmesh-style macro variable) rather than a
     /// TSQL-style `@variable` identifier. When true, `@` is emitted as `DAt` so the
-    /// parser builds `Parameter { style: At }`.
+    /// parser builds `Parameter { style: At }`, unless the word is immediately
+    /// followed by `(` (a macro call), which stays an identifier.
     pub at_sign_is_parameter: bool,
     /// Whether INSERT ... FORMAT <name> should treat subsequent data as raw (ClickHouse).
     /// When true, after tokenizing `INSERT ... FORMAT <non-VALUES-name>`, all text until
@@ -1852,11 +1853,12 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
 
     /// Whether the `@word` starting at `current` is immediately followed by `(`,
     /// i.e. a sqlmesh macro function call such as `@each(...)`.
+    // ponytail: whitespace before `(` (`@each (x)`) is not treated as a call.
     fn at_word_is_call(&self) -> bool {
         let mut i = self.current + 1;
         while i < self.size {
             let c = self.char_at(i);
-            if c.is_alphanumeric() || c == '_' {
+            if c.is_alphanumeric() || c == '_' || c == '$' || c == '#' || c == '@' {
                 i += 1;
             } else {
                 return c == '(';
@@ -2435,8 +2437,7 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
 
         // TSQL: Check for identifiers starting with # (temp tables) or @ (variables)
         // e.g., #temp, ##global_temp, @variable
-        if (c == '#'
-            || (c == '@' && !(self.config.at_sign_is_parameter && !self.at_word_is_call())))
+        if (c == '#' || (c == '@' && (!self.config.at_sign_is_parameter || self.at_word_is_call())))
             && (self.peek_next().is_alphanumeric()
                 || self.peek_next() == '_'
                 || self.peek_next() == '#')
