@@ -1535,6 +1535,10 @@ pub struct TokenizerConfig {
     /// When true, a bare `$` that is not part of a dollar-quoted string or positional
     /// parameter is treated as an identifier character.
     pub dollar_sign_is_identifier: bool,
+    /// Whether `@name` is a parameter (sqlmesh-style macro variable) rather than a
+    /// TSQL-style `@variable` identifier. When true, `@` is emitted as `DAt` so the
+    /// parser builds `Parameter { style: At }`.
+    pub at_sign_is_parameter: bool,
     /// Whether INSERT ... FORMAT <name> should treat subsequent data as raw (ClickHouse).
     /// When true, after tokenizing `INSERT ... FORMAT <non-VALUES-name>`, all text until
     /// the next blank line or end of input is consumed as a raw data token.
@@ -1582,6 +1586,7 @@ impl Default for TokenizerConfig {
             string_escapes_allowed_in_raw_strings: true,
             hash_comments: false,
             dollar_sign_is_identifier: false,
+            at_sign_is_parameter: false,
             insert_format_raw_data: false,
             numbers_can_be_underscore_separated: false,
             recover_terminal_backslash_quote: false,
@@ -1843,6 +1848,21 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
         } else {
             self.char_at(self.current)
         }
+    }
+
+    /// Whether the `@word` starting at `current` is immediately followed by `(`,
+    /// i.e. a sqlmesh macro function call such as `@each(...)`.
+    fn at_word_is_call(&self) -> bool {
+        let mut i = self.current + 1;
+        while i < self.size {
+            let c = self.char_at(i);
+            if c.is_alphanumeric() || c == '_' {
+                i += 1;
+            } else {
+                return c == '(';
+            }
+        }
+        false
     }
 
     #[inline]
@@ -2415,7 +2435,8 @@ impl<'a, C: TokenizerCursor, T: TokenOutput> TokenizerState<'a, C, T> {
 
         // TSQL: Check for identifiers starting with # (temp tables) or @ (variables)
         // e.g., #temp, ##global_temp, @variable
-        if (c == '#' || c == '@')
+        if (c == '#'
+            || (c == '@' && !(self.config.at_sign_is_parameter && !self.at_word_is_call())))
             && (self.peek_next().is_alphanumeric()
                 || self.peek_next() == '_'
                 || self.peek_next() == '#')

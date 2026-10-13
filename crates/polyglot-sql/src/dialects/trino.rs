@@ -30,6 +30,7 @@ impl DialectImpl for TrinoDialect {
         // Trino does NOT support QUALIFY - it's a valid identifier
         // (unlike Snowflake, BigQuery, DuckDB which have QUALIFY clause)
         config.keywords.remove("QUALIFY");
+        config.at_sign_is_parameter = true;
         config
     }
 
