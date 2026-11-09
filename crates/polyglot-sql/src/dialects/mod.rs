@@ -65,6 +65,11 @@ mod oracle;
 mod postgres;
 #[cfg(feature = "dialect-presto")]
 mod presto;
+#[cfg(all(
+    feature = "transpile",
+    any(feature = "dialect-presto", feature = "dialect-trino")
+))]
+mod presto_family;
 #[cfg(feature = "dialect-redshift")]
 mod redshift;
 #[cfg(feature = "dialect-risingwave")]
