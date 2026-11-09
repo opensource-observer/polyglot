@@ -38,12 +38,15 @@ fn timestamp_with_a_literal_zone_is_a_cast_at_that_zone() {
 }
 
 #[test]
-fn timestamp_with_a_computed_zone_is_left_alone() {
+fn timestamp_with_a_computed_or_unknown_zone_is_left_alone() {
     for dialect in DIALECTS {
-        assert_eq!(
-            reprint("SELECT TIMESTAMP(d, z)", dialect),
+        for sql in [
             "SELECT TIMESTAMP(d, z)",
-        );
+            "SELECT TIMESTAMP(d, '12:00:00')",
+            "SELECT TIMESTAMP(d, 'Not/AZone')",
+        ] {
+            assert_eq!(reprint(sql, dialect), sql);
+        }
     }
 }
 
