@@ -2248,7 +2248,11 @@ pub(super) fn normalize(
                             // DATE_BIN -> TIME_BUCKET for DuckDB
                             "DATE_BIN" if matches!(target, DialectType::DuckDB) => Action::Temporal(temporal::Action::DateBinConvert),
                             // Multi-arg MIN(a,b,c) -> LEAST, MAX(a,b,c) -> GREATEST
-                            "MIN" | "MAX" if f.args.len() > 1 && !matches!(target, DialectType::SQLite) => Action::Scalar(scalar::Action::MinMaxToLeastGreatest),
+                            // ...except Presto/Trino's two-argument MIN(x, n)/MAX(x, n), the
+                            // aggregate of the n smallest/largest values, which sqlglot keeps.
+                            "MIN" | "MAX" if f.args.len() > 1
+                                && !matches!(target, DialectType::SQLite)
+                                && !(f.args.len() == 2 && matches!(source, DialectType::Presto | DialectType::Trino | DialectType::Athena)) => Action::Scalar(scalar::Action::MinMaxToLeastGreatest),
                             // ClickHouse uniq -> APPROX_COUNT_DISTINCT for other dialects
                             "UNIQ" if matches!(source, DialectType::ClickHouse) && !matches!(target, DialectType::ClickHouse) => Action::Aggregates(aggregates::Action::ClickHouseUniqToApproxCountDistinct),
                             // ClickHouse any -> ANY_VALUE for other dialects
