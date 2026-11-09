@@ -22,3 +22,15 @@ fn a_set_operation_after_an_unaliased_derived_table_stays_outside_it() {
         }
     }
 }
+
+#[test]
+fn a_parenthesized_set_operation_keeps_its_own_modifiers_inside_its_parens() {
+    for sql in [
+        "SELECT * FROM ((SELECT 1) UNION (SELECT 2))",
+        "SELECT * FROM ((SELECT 1) UNION SELECT 2)",
+        "SELECT * FROM (((SELECT 1) UNION SELECT 2) ORDER BY x LIMIT 1 OFFSET 1)",
+        "SELECT * FROM ((SELECT 1) AS a UNION ALL (SELECT 2) AS b)",
+    ] {
+        assert_eq!(reprint(sql, DialectType::Generic), sql);
+    }
+}

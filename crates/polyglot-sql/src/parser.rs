@@ -4894,10 +4894,26 @@ impl Parser {
                     || self.check(TokenType::Intersect)
                     || self.check(TokenType::Except);
                 let result = if had_set_operation {
-                    // This is a set operation like ((SELECT 1) UNION (SELECT 2))
-                    // Wrap inner in a subquery-like expression and parse set operation
+                    // This is a set operation like ((SELECT 1) UNION (SELECT 2)):
+                    // the parens around it make it one derived table.
                     let set_result = self.parse_set_operation(inner)?;
-                    set_result
+                    Expression::Subquery(Box::new(Subquery {
+                        this: set_result,
+                        alias: None,
+                        column_aliases: Vec::new(),
+                        alias_explicit_as: false,
+                        alias_keyword: None,
+                        order_by: None,
+                        limit: None,
+                        offset: None,
+                        distribute_by: None,
+                        sort_by: None,
+                        cluster_by: None,
+                        lateral: false,
+                        modifiers_inside: false,
+                        trailing_comments: Vec::new(),
+                        inferred_type: None,
+                    }))
                 } else if self.check(TokenType::Cross)
                     || self.check(TokenType::Outer)
                     || self.check(TokenType::Inner)
