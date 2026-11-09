@@ -4807,34 +4807,11 @@ impl Parser {
                 };
                 self.expect(TokenType::RParen)?;
                 let trailing = self.previous_trailing_comments().to_vec();
-                // Check for set operations after parenthesized query
-                // If there's a set operation, wrap query in Subquery first to preserve parens
-                // e.g., (SELECT 1) UNION (SELECT 2) - the left operand needs Subquery wrapper
-                let result = if self.check(TokenType::Union)
-                    || self.check(TokenType::Intersect)
-                    || self.check(TokenType::Except)
-                {
-                    let left = Expression::Subquery(Box::new(Subquery {
-                        this: query,
-                        alias: None,
-                        column_aliases: Vec::new(),
-                        alias_explicit_as: false,
-                        alias_keyword: None,
-                        order_by: None,
-                        limit: None,
-                        offset: None,
-                        lateral: false,
-                        modifiers_inside: false,
-                        trailing_comments: Vec::new(),
-                        distribute_by: None,
-                        sort_by: None,
-                        cluster_by: None,
-                        inferred_type: None,
-                    }));
-                    self.parse_set_operation(left)?
-                } else {
-                    query
-                };
+                // A set operation after the closing paren is not part of this
+                // FROM item: it belongs to the enclosing query, or, inside
+                // nested parens (`((SELECT 1) UNION (SELECT 2))`), to the
+                // nested-paren branch, which parses it itself.
+                let result = query;
                 Expression::Subquery(Box::new(Subquery {
                     this: result,
                     alias: None,

@@ -868,9 +868,11 @@ mod tests {
         let qualified = qualify_tables(expr, &options);
         let sql = gen(&qualified);
 
+        // The parser keeps the set operation outside the derived table, so
+        // there is no wrapper left to normalize.
         assert_eq!(
             sql,
-            "SELECT * FROM (SELECT * FROM (SELECT * FROM tab_1 AS tab_1) AS _0 UNION ALL SELECT * FROM (SELECT * FROM tab_1 AS tab_1) AS _1) AS _2"
+            "SELECT * FROM (SELECT * FROM tab_1 AS tab_1) AS _0 UNION ALL SELECT * FROM (SELECT * FROM tab_1 AS tab_1) AS _1"
         );
     }
 }
