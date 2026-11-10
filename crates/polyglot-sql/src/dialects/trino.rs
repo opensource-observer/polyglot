@@ -202,6 +202,8 @@ impl TrinoDialect {
     fn transform_function(&self, f: Function) -> Result<Expression> {
         let name_upper = f.name.to_uppercase();
         match name_upper.as_str() {
+            "TIMESTAMP" => Ok(super::presto_family::timestamp_function_as_cast(f)),
+
             // IFNULL -> COALESCE
             "IFNULL" if f.args.len() == 2 => Ok(Expression::Coalesce(Box::new(VarArgFunc {
                 original_name: None,
