@@ -39,9 +39,9 @@ change and the fork moves past it.
 | #11 | Scope building walks every child field of an expression | scope | not upstream |
 | #12 | Relations inside parenthesized joins are registered in their scope | scope | overlaps upstream 0.14's join-group scopes |
 | #13 | Aliases of table functions and `MATCH_RECOGNIZE` are registered | scope | not upstream |
-| #16 | Trino/Presto `TIMESTAMP(x)` → `CAST(x AS TIMESTAMP)` (sqlglot parity) | dialect | open; not in 0.14.1 |
-| #17 | Trino/Presto two-argument `MAX(x, n)`/`MIN(x, n)` stay aggregates (sqlglot parity) | dialect | open; not in 0.14.1 |
-| #18 | A set operation after an unaliased derived table stays outside it | parser | open; not in 0.14.1 |
+| #16 | Trino/Presto `TIMESTAMP(x)` → `CAST(x AS TIMESTAMP)` (sqlglot parity) | dialect | not upstream (0.14.1) |
+| #17 | Trino/Presto two-argument `MAX(x, n)`/`MIN(x, n)` stay aggregates (sqlglot parity) | dialect | not upstream (0.14.1) |
+| #18 | A set operation after an unaliased derived table stays outside it | parser | not upstream (0.14.1) |
 
 ## Adding a change
 
